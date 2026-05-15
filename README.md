@@ -1,0 +1,1 @@
+AltiWatch - DIY skydiving altimeter built on Waveshare ESP32-S3-Touch-LCD-2.8 with BMP390 sensor.
