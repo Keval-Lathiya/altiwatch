@@ -1,0 +1,20 @@
+# PlatformIO
+.pio/
+.pioenv/
+.piolibdeps/
+
+# Build output
+build/
+dist/
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
