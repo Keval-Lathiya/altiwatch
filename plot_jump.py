@@ -106,21 +106,19 @@ def plot_jump(df: pd.DataFrame, source_path: Path | str) -> plt.Figure:
     vs = df["vspeed_fps"]
 
     # -- layout --------------------------------------------------------------
-    fig = plt.figure(figsize=(14, 9), facecolor=_BG)
+    fig = plt.figure(figsize=(14, 7), facecolor=_BG)
     gs  = gridspec.GridSpec(
-        3, 1,
-        height_ratios=[3, 2, 2],
+        2, 1,
+        height_ratios=[3, 2],
         hspace=0.06,
-        left=0.07, right=0.97, top=0.93, bottom=0.07,
+        left=0.07, right=0.97, top=0.93, bottom=0.08,
     )
     ax1 = fig.add_subplot(gs[0])
     ax2 = fig.add_subplot(gs[1], sharex=ax1)
-    ax3 = fig.add_subplot(gs[2], sharex=ax1)
 
-    for ax in (ax1, ax2, ax3):
+    for ax in (ax1, ax2):
         _style_ax(ax)
     plt.setp(ax1.get_xticklabels(), visible=False)
-    plt.setp(ax2.get_xticklabels(), visible=False)
 
     # -- panel 1 — altitude --------------------------------------------------
     ax1.fill_between(t, df["agl_ft"], alpha=0.15, color=C_ALT)
@@ -158,20 +156,9 @@ def plot_jump(df: pd.DataFrame, source_path: Path | str) -> plt.Figure:
     )
     ax2.axhline(0, color=_MUTED, linewidth=0.7, linestyle=":", alpha=0.7)
     ax2.set_ylabel("Vert speed  (fps)", color=_FG, fontsize=10)
+    ax2.set_xlabel("Time  (s)", color=_FG, fontsize=10)
+    ax2.tick_params(axis="x", colors=_FG)
     ax2.legend(
-        loc="upper right", fontsize=7.5,
-        facecolor=_BG, edgecolor=_BORDER, labelcolor=_MUTED, framealpha=0.9,
-    )
-
-    # -- panel 3 — acceleration magnitude ------------------------------------
-    ax3.fill_between(t, df["acc_g"], alpha=0.18, color=C_ACC)
-    ax3.plot(t, df["acc_g"], color=C_ACC, linewidth=1.4, alpha=0.9)
-    ax3.axhline(1.0, color=_MUTED, linewidth=0.9, linestyle="--", alpha=0.7,
-                label="1.0 g  (reference)")
-    ax3.set_ylabel("|a|  (g)", color=_FG, fontsize=10)
-    ax3.set_xlabel("Time  (s)", color=_FG, fontsize=10)
-    ax3.tick_params(axis="x", colors=_FG)
-    ax3.legend(
         loc="upper right", fontsize=7.5,
         facecolor=_BG, edgecolor=_BORDER, labelcolor=_MUTED, framealpha=0.9,
     )
