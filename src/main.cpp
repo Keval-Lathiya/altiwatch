@@ -48,6 +48,12 @@ struct Settings {
     float threshFreefall         = -50.0f;
     float threshCanopy           = -25.0f;
     float threshLanded           =   0.8f;
+
+    // Altitude alert zone — flash screen when descending through this band
+    // REAL: alertStartFt = 3000.0f, alertStopFt = 500.0f  |  TEST: 10 / 2
+    float alertStartFt           =   10.0f;  // ft AGL where flashing begins  (REAL: 3000)
+    float alertStopFt            =    2.0f;  // ft AGL where flashing stops   (REAL:  500)
+    bool  alertsEnabled          = true;
 } cfg;
 
 // ─── Calibration ────────────────────────────────────────────────────────────
@@ -140,6 +146,14 @@ static uint32_t lastBootMs    = 0;
 static uint32_t autoStartSustainMs = 0;
 static uint32_t autoStopSustainMs  = 0;
 static float    autoStopRefAlt     = 0.0f;
+
+// ─── Alert flash state ───────────────────────────────────────────────────────
+enum AlertState { ALERT_OFF, ALERT_ON };
+static AlertState alertState  = ALERT_OFF;
+static uint32_t   lastFlashMs = 0;
+static bool       flashRed    = false;
+static float      cachedAltFt = 0.0f;  // updated each 10Hz tick
+static float      cachedVsFps = 0.0f;
 
 Arduino_DataBus *bus = new Arduino_ESP32SPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI, GFX_NOT_DEFINED);
 Arduino_GFX    *gfx  = new Arduino_ST7789(bus, LCD_RST, 0, true, DISP_W, DISP_H);
@@ -533,6 +547,57 @@ static void checkAutoTriggers(float vsFps, float aglFt, uint32_t now) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Alert zone flash — non-blocking; never touches cal or log state
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Half-period in ms: 500 ms (slow) near alertStartFt → 100 ms (fast) near alertStopFt
+static uint32_t alertFlashHalfMs(float aglFt) {
+    float range = cfg.alertStartFt - cfg.alertStopFt;
+    if (range <= 0.0f) return 150;
+    float t = constrain((aglFt - cfg.alertStopFt) / range, 0.0f, 1.0f);
+    return (uint32_t)(100.0f + t * 400.0f);
+}
+
+static void checkAlert(float aglFt, float vsFps, uint32_t now) {
+    if (!cfg.alertsEnabled || !cal.isValid()) return;
+    bool inZone = (vsFps < 0.0f)
+               && (aglFt < cfg.alertStartFt)
+               && (aglFt > cfg.alertStopFt);
+    if (inZone && alertState == ALERT_OFF) {
+        alertState  = ALERT_ON;
+        flashRed    = true;
+        lastFlashMs = now;
+        Serial.printf("ALERT ON:  %.0fft  flash-half=%ums\n",
+                      aglFt, (unsigned)alertFlashHalfMs(aglFt));
+    } else if (!inZone && alertState == ALERT_ON) {
+        alertState = ALERT_OFF;
+        flashRed   = false;
+        drawStaticUI();
+        updateCalBadge();
+        updateBatDisplay();
+        updateAltDisplay(aglFt);
+        updateVsDisplay(vsFps);
+        updateStatusLine();
+        Serial.printf("ALERT OFF: %.0fft\n", aglFt);
+    }
+}
+
+// Called every loop() iteration — decoupled from 10Hz sample gate
+static void tickAlert(uint32_t now) {
+    if (alertState != ALERT_ON) return;
+    uint32_t halfMs = alertFlashHalfMs(cachedAltFt);
+    if (now - lastFlashMs < halfMs) return;
+    lastFlashMs = now;
+    flashRed = !flashRed;
+    gfx->fillScreen(flashRed ? C_RED : C_BG);
+    // AGL number always drawn on top in white — altitude awareness is the point
+    char buf[12];
+    if (cal.isValid()) snprintf(buf, sizeof(buf), "%+.0f", cachedAltFt);
+    else               snprintf(buf, sizeof(buf), "%.0f",  cachedAltFt);
+    centeredText(Y_ALT, 6, C_WHITE, buf);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Button — short press (<1 s on release) = toggle log
 //           long  press (≥2 s on hold)   = manual calibration
 // ═══════════════════════════════════════════════════════════════════════════
@@ -602,7 +667,7 @@ void setup() {
                       LittleFS.usedBytes(), LittleFS.totalBytes());
     }
 
-    Serial.println("AltiWatch stage 5 — collecting boot samples...");
+    Serial.println("AltiWatch stage 6 — collecting boot samples...");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -622,6 +687,9 @@ void loop() {
         handleBootSample(bmp.readAltitude(cfg.seaLevelHpa));
         return;
     }
+
+    // Alert flash runs at full loop() speed, independent of 10Hz sensor gate
+    tickAlert(now);
 
     // ── 10 Hz sample tick ─────────────────────────────────────────────────
     if (now - lastSampleMs < 100) return;
@@ -656,12 +724,16 @@ void loop() {
     float dispAltM  = cal.isValid() ? (absAltM - cal.groundAltM) : absAltM;
     float dispAltFt = dispAltM * 3.28084f;
 
+    cachedAltFt = dispAltFt;
+    cachedVsFps = vsFps;
+
     // ── Build sample, push to rolling buffer ──────────────────────────────
     Sample s = { now, dispAltFt, vsFps, pressHpa, tempC, imuAx, imuAy, imuAz };
     rollPush(s);
     if (logActive) writeSampleToLog(s);
 
     checkAutoTriggers(vsFps, dispAltFt, now);
+    checkAlert(dispAltFt, vsFps, now);
 
     // ── Serial ────────────────────────────────────────────────────────────
     Serial.printf("%s %+.0fft  %+.1ffps  %.2fhPa  %.1fC  [%.2f,%.2f,%.2f]g%s\n",
@@ -671,8 +743,8 @@ void loop() {
                   imuAx, imuAy, imuAz,
                   logActive ? "  REC" : "");
 
-    // ── 2 Hz display refresh ──────────────────────────────────────────────
-    if (now - lastDisplayMs >= 500) {
+    // ── 2 Hz display refresh (suppressed during alert — tickAlert owns screen)
+    if (alertState == ALERT_OFF && now - lastDisplayMs >= 500) {
         lastDisplayMs = now;
         updateAltDisplay(dispAltFt);
         updateVsDisplay(vsFps);
