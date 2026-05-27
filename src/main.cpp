@@ -414,6 +414,71 @@ void stopLog() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Serial command interface
+//   PING          → PONG   (readiness check)
+//   LIST          → LIST_START / <name> <bytes> / LIST_END
+//   DUMP          → DUMP_START / FILE_START <name> / …csv… / FILE_END <name> / DUMP_END
+// Commands are ASCII, terminated by \n or \r.  Case-insensitive.
+// DUMP blocks the loop for the duration; sensor + display pause briefly.
+// ═══════════════════════════════════════════════════════════════════════════
+static void cmdList() {
+    Serial.println("LIST_START");
+    File root = LittleFS.open("/");
+    File f = root.openNextFile();
+    while (f) {
+        Serial.printf("%s %u\n", f.name(), (unsigned)f.size());
+        f.close();
+        f = root.openNextFile();
+    }
+    root.close();
+    Serial.println("LIST_END");
+}
+
+static void cmdDump() {
+    if (logActive)
+        Serial.println("WARN stop recording first — current open file not yet flushed");
+    Serial.println("DUMP_START");
+    File root = LittleFS.open("/");
+    File f = root.openNextFile();
+    while (f) {
+        Serial.printf("FILE_START %s\n", f.name());
+        uint8_t buf[256];
+        size_t n;
+        while ((n = f.read(buf, sizeof(buf))) > 0)
+            Serial.write(buf, n);
+        // guarantee FILE_END lands on its own line even if file lacked trailing \n
+        if (f.size() > 0) {
+            f.seek(f.size() - 1);
+            if (f.read() != '\n') Serial.write('\n');
+        }
+        Serial.printf("FILE_END %s\n", f.name());
+        f.close();
+        f = root.openNextFile();
+    }
+    root.close();
+    Serial.println("DUMP_END");
+}
+
+static void handleSerialCmd(const char *cmd) {
+    if      (strcmp(cmd, "PING") == 0) Serial.println("PONG");
+    else if (strcmp(cmd, "LIST") == 0) cmdList();
+    else if (strcmp(cmd, "DUMP") == 0) cmdDump();
+}
+
+static void handleSerialInput() {
+    static char buf[8];
+    static uint8_t len = 0;
+    while (Serial.available()) {
+        char c = (char)Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (len > 0) { buf[len] = '\0'; handleSerialCmd(buf); len = 0; }
+        } else if (len < sizeof(buf) - 1) {
+            buf[len++] = (char)toupper((unsigned char)c);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // IMU (QMI8658 at 0x6B)
 // ═══════════════════════════════════════════════════════════════════════════
 static void initIMU() {
@@ -547,6 +612,7 @@ void loop() {
     uint32_t now = millis();
 
     if (bootPhase == BOOT_RUNNING) handleButton();
+    handleSerialInput();
 
     // ── Boot sampling (500 ms interval) ───────────────────────────────────
     if (bootPhase == BOOT_SAMPLING) {
