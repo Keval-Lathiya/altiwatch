@@ -8,10 +8,10 @@ Protocol (device side):
   DUMP  → DUMP_START / FILE_START <filename>\n / ...csv... / FILE_END <filename>\n / DUMP_END
 
 Usage:
-  python pull_jumps.py [port] [--baud N] [--out DIR] [--list-only]
+  python pull_jumps.py [port] [--baud N] [--out DIR] [--list-only] [--no-plot]
 
 Requires:
-  pip install pyserial
+  pip install pyserial pandas matplotlib numpy
 """
 
 from __future__ import annotations
@@ -25,6 +25,15 @@ try:
     import serial
 except ImportError:
     sys.exit("pyserial not found — run: pip install pyserial")
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")  # non-interactive backend — no GUI window needed here
+    from plot_jump import load_jump, plot_jump, print_summary
+    import matplotlib.pyplot as plt
+    _PLOT_AVAILABLE = True
+except ImportError:
+    _PLOT_AVAILABLE = False
 
 
 # -- tunables ------------------------------------------------------------------
@@ -143,6 +152,28 @@ def cmd_dump(ser: serial.Serial, out_dir: Path) -> tuple[list[Path], list[str]]:
     return saved, skipped
 
 
+# -- plotting -----------------------------------------------------------------
+
+def _plot_saved(paths: list[Path]) -> None:
+    """Generate and save a PNG plot for each downloaded CSV."""
+    if not _PLOT_AVAILABLE:
+        print("\nPlotting skipped — install pandas/matplotlib/numpy to enable.")
+        return
+
+    print(f"\nPlotting {len(paths)} file(s)…")
+    for p in paths:
+        try:
+            df  = load_jump(p)
+            print_summary(df, p)
+            fig = plot_jump(df, p)
+            out = p.with_suffix(".png")
+            fig.savefig(out, dpi=150, facecolor=fig.get_facecolor(), bbox_inches="tight")
+            plt.close(fig)
+            print(f"  Saved plot: {out}")
+        except Exception as exc:
+            print(f"  Could not plot {p.name}: {exc}", file=sys.stderr)
+
+
 # -- main ---------------------------------------------------------------------
 
 def main() -> None:
@@ -159,6 +190,8 @@ def main() -> None:
                         help="Output directory for downloaded CSVs")
     parser.add_argument("--list-only", action="store_true",
                         help="Show files on device without downloading")
+    parser.add_argument("--no-plot", action="store_true",
+                        help="Skip automatic plotting after download")
     args = parser.parse_args()
 
     out_dir = Path(args.out)
@@ -232,6 +265,9 @@ def main() -> None:
         for p in saved:
             print(f"    {p}  ({p.stat().st_size:,} bytes)")
         print(f"{'-'*50}")
+
+        if not args.no_plot:
+            _plot_saved(saved)
     else:
         print("Nothing saved.")
 
