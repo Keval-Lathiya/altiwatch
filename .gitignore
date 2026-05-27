@@ -19,5 +19,6 @@ Thumbs.db
 # Claude Code
 .claude/
 
-# Jump logs — personal data, local only
+# Jump logs and plots — personal data, local only
 jumps/*.csv
+jumps/*.png
