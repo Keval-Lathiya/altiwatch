@@ -2,66 +2,89 @@
 #include <Arduino_GFX_Library.h>
 #include <Wire.h>
 #include <Adafruit_BMP3XX.h>
+#include <LittleFS.h>
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Settings — single source of truth. BLE-ready: serialise this struct.
-// INVARIANT: calibration state (groundAltM, calSource) is NEVER modified by
-// jump logging. Only doAutoCalibration() and doManualCalibration() may write it.
+// INVARIANT: cal.groundAltM / cal.source are written ONLY by applyCalibration().
+// Jump logging code must never touch those fields.
 // ═══════════════════════════════════════════════════════════════════════════
 struct Settings {
-    // Sensor
-    float   seaLevelHpa         = 1013.25f;
-    uint8_t bmpAddr             = 0x77;
+    float   seaLevelHpa          = 1013.25f;
+    uint8_t bmpAddr              = 0x77;
+    uint8_t imuAddr              = 0x6B;
+    uint8_t rtcAddr              = 0x51;
 
-    // Boot auto-calibration
-    uint8_t autoCalSamples      = 10;     // readings collected (× 500 ms = 5 s)
-    float   autoCalStableThresh = 3.05f;  // metres  ≈ 10 ft — stable if below
+    // Boot auto-cal
+    uint8_t  autoCalSamples      = 10;
+    float    autoCalStableThresh = 3.05f;   // metres ≈ 10 ft
 
-    // Manual re-calibration
-    uint32_t calPressMs         = 2000;   // BOOT hold duration
-    uint8_t  calAvgCount        = 10;     // readings averaged (×100 ms)
+    // Manual cal (long press)
+    uint32_t calPressMs          = 2000;
+    uint8_t  calAvgCount         = 10;
 
-    // Vertical speed
-    uint8_t  vsDeadband         = 30;     // ft/min noise floor
+    // Short press (log toggle)
+    uint32_t shortPressMaxMs     = 1000;
 
-    // Battery ADC  (GPIO6, 2:1 divider assumed — adjust *Mv values if wrong)
-    uint8_t  batAdcPin          = 6;
-    int      batMvFull          = 4200;
-    int      batMvEmpty         = 3300;
+    // Vertical speed deadband (ft/s)
+    float    vsDeadbandFps       = 0.5f;
 
-    // Future state-machine thresholds (ft/min)
-    float threshClimb           =  200.0f;
-    float threshFreefall        = -3000.0f;
-    float threshCanopy          = -1500.0f;
-    float threshLanded          =   50.0f;
+    // Battery ADC (GPIO6, 2:1 divider)
+    uint8_t  batAdcPin           = 6;
+    int      batMvFull           = 4200;
+    int      batMvEmpty          = 3300;
+
+    // Auto-start: freefall sustained threshold
+    float    autoStartFps        = -30.0f;
+    float    autoStartSustainSec = 2.0f;
+
+    // Auto-stop: slow + stable altitude
+    float    autoStopFps         = -15.0f;
+    float    autoStopAltStabFt   = 10.0f;
+    float    autoStopSustainSec  = 30.0f;
+
+    // Future state-machine thresholds (ft/s)
+    float threshClimb            =   3.3f;
+    float threshFreefall         = -50.0f;
+    float threshCanopy           = -25.0f;
+    float threshLanded           =   0.8f;
 } cfg;
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Calibration state
-// Source tracks HOW we got a ground zero so the UI can show it.
-// Jump logging code must never touch these variables.
-// ═══════════════════════════════════════════════════════════════════════════
+// ─── Calibration ────────────────────────────────────────────────────────────
 enum CalSource { CAL_NONE, CAL_AUTO, CAL_MANUAL };
-
 struct CalState {
     float     groundAltM = 0.0f;
     CalSource source      = CAL_NONE;
     bool isValid() const { return source != CAL_NONE; }
 } cal;
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Boot phase — auto-cal sampling runs once on startup
-// ═══════════════════════════════════════════════════════════════════════════
+// ─── Boot phase ─────────────────────────────────────────────────────────────
 enum BootPhase { BOOT_SAMPLING, BOOT_RUNNING };
 BootPhase bootPhase = BOOT_SAMPLING;
-
 static const uint8_t MAX_BOOT_SAMPLES = 10;
 float   bootBuf[MAX_BOOT_SAMPLES];
 uint8_t bootIdx = 0;
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Hardware
-// ═══════════════════════════════════════════════════════════════════════════
+// ─── Jump logging ────────────────────────────────────────────────────────────
+enum LogTrigger { TRIG_MANUAL, TRIG_AUTO };
+
+struct Sample {
+    uint32_t time_ms;
+    float    agl_ft, vspeed_fps, pressure_hpa, temp_c, ax, ay, az;
+};
+
+#define ROLL_SIZE 300
+static Sample   rollBuf[ROLL_SIZE];
+static uint16_t rollHead  = 0;
+static uint16_t rollCount = 0;
+
+static File       logFile;
+static bool       logActive      = false;
+static uint32_t   logStartMs     = 0;
+static LogTrigger logTrigger     = TRIG_MANUAL;
+static uint32_t   logSampleCount = 0;
+
+// ─── Hardware pins ───────────────────────────────────────────────────────────
 #define LCD_SCK   40
 #define LCD_MOSI  45
 #define LCD_CS    42
@@ -70,12 +93,9 @@ uint8_t bootIdx = 0;
 #define LCD_BL     5
 #define I2C_SDA   11
 #define I2C_SCL   10
-// BOOT button GPIO0, active LOW — Waveshare ESP32-S3-Touch-LCD-2.x family
 #define BTN_PIN    0
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Colours (RGB565)
-// ═══════════════════════════════════════════════════════════════════════════
+// ─── Colours (RGB565) ────────────────────────────────────────────────────────
 #define C_BG      0x0000
 #define C_WHITE   0xFFFF
 #define C_GRAY    0x4208
@@ -84,44 +104,72 @@ uint8_t bootIdx = 0;
 #define C_RED     0xF800
 #define C_YELLOW  0xFFE0
 #define C_CYAN    0x07FF
-#define C_ORANGE  0xFC60
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Display layout (240×320 portrait)
-// ═══════════════════════════════════════════════════════════════════════════
-#define DISP_W  240
-#define DISP_H  320
+// ─── Display layout (240×320 portrait) ──────────────────────────────────────
+#define DISP_W   240
+#define DISP_H   320
+#define Y_HDR      3
+#define Y_DIV1    16
+#define Y_ALT_LBL 21
+#define Y_ALT     31
+#define Y_DIV2   107
+#define Y_VS_LBL 112
+#define Y_VS     122
+#define Y_VS_SUB 150
+#define Y_DIV3   162
+#define Y_DIV4   285
+#define Y_STATUS 294
 
-// Row positions
-#define Y_HDR        3    // "AltiWatch" | cal badge | bat%
-#define Y_DIV1      16
-#define Y_ALT_LBL   21    // "FT AGL" / "FT ABS" small label
-#define Y_ALT       31    // big altitude  (s6 = 36×48 px/char)
-#define Y_DIV2     107
-#define Y_VS_LBL   112    // "VERT SPEED"
-#define Y_VS       122    // vspeed  (s3 = 18×24 px/char)
-#define Y_VS_SUB   150    // m/s subscript
-#define Y_DIV3     162
-// y 163-284 reserved (barograph future)
-#define Y_DIV4     285
-#define Y_STATUS   294    // status / cal-warning line
-
-// ═══════════════════════════════════════════════════════════════════════════
-// Runtime state
-// ═══════════════════════════════════════════════════════════════════════════
+// ─── Runtime state ──────────────────────────────────────────────────────────
 static const uint8_t VS_SLOTS = 8;
-float    vsAlt[VS_SLOTS];
-uint32_t vsTime[VS_SLOTS];
-uint8_t  vsIdx  = 0;
-bool     vsFull = false;
+static float    vsAlt[VS_SLOTS];
+static uint32_t vsTime[VS_SLOTS];
+static uint8_t  vsIdx  = 0;
+static bool     vsFull = false;
 
-uint32_t btnPressStart = 0;
-bool     btnWasDown    = false;
-bool     longFired     = false;
+static float    imuAx = 0.0f, imuAy = 0.0f, imuAz = 0.0f;
+
+static uint32_t btnPressStart = 0;
+static bool     btnWasDown    = false;
+static bool     longFired     = false;
+
+static uint32_t lastSampleMs  = 0;
+static uint32_t lastDisplayMs = 0;
+static uint32_t lastBootMs    = 0;
+
+static uint32_t autoStartSustainMs = 0;
+static uint32_t autoStopSustainMs  = 0;
+static float    autoStopRefAlt     = 0.0f;
 
 Arduino_DataBus *bus = new Arduino_ESP32SPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI, GFX_NOT_DEFINED);
 Arduino_GFX    *gfx  = new Arduino_ST7789(bus, LCD_RST, 0, true, DISP_W, DISP_H);
 Adafruit_BMP3XX bmp;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// I2C helpers
+// ═══════════════════════════════════════════════════════════════════════════
+static void iicWrite(uint8_t addr, uint8_t reg, uint8_t val) {
+    Wire.beginTransmission(addr);
+    Wire.write(reg); Wire.write(val);
+    Wire.endTransmission();
+}
+static uint8_t iicRead1(uint8_t addr, uint8_t reg) {
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    Wire.endTransmission(false);
+    Wire.requestFrom(addr, (uint8_t)1);
+    return Wire.available() ? Wire.read() : 0xFF;
+}
+static bool iicReadBuf(uint8_t addr, uint8_t reg, uint8_t *buf, uint8_t len) {
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) return false;
+    Wire.requestFrom(addr, (uint8_t)len);
+    if ((uint8_t)Wire.available() < len) return false;
+    for (uint8_t i = 0; i < len; i++) buf[i] = Wire.read();
+    return true;
+}
+static uint8_t bcdDec(uint8_t bcd) { return (bcd >> 4) * 10 + (bcd & 0x0F); }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Display helpers
@@ -136,7 +184,6 @@ void updateCentered(int16_t y, int16_t h, uint8_t sz, uint16_t col, const char *
     gfx->fillRect(0, y, DISP_W, h, C_BG);
     centeredText(y, sz, col, s);
 }
-
 void drawStaticUI() {
     gfx->fillScreen(C_BG);
     gfx->setTextColor(C_GRAY); gfx->setTextSize(1);
@@ -148,72 +195,65 @@ void drawStaticUI() {
     gfx->setTextColor(C_DKGRAY); gfx->setTextSize(1);
     gfx->setCursor(4, Y_VS_LBL); gfx->print("VERT SPEED");
 }
-
-// Cal badge — top-centre of header row
 void updateCalBadge() {
     gfx->fillRect(80, Y_HDR, 80, 9, C_BG);
     switch (cal.source) {
         case CAL_AUTO:
             gfx->setTextColor(C_GREEN);  gfx->setTextSize(1);
-            gfx->setCursor(92, Y_HDR);   gfx->print("[AUTO CAL]");
-            break;
+            gfx->setCursor(92, Y_HDR);   gfx->print("[AUTO CAL]");  break;
         case CAL_MANUAL:
             gfx->setTextColor(C_CYAN);   gfx->setTextSize(1);
-            gfx->setCursor(89, Y_HDR);   gfx->print("[MANUAL CAL]");
-            break;
+            gfx->setCursor(89, Y_HDR);   gfx->print("[MANUAL CAL]"); break;
         case CAL_NONE:
             gfx->setTextColor(C_YELLOW); gfx->setTextSize(1);
-            gfx->setCursor(96, Y_HDR);   gfx->print("[UNCAL]");
-            break;
+            gfx->setCursor(96, Y_HDR);   gfx->print("[UNCAL]");      break;
     }
 }
-
 void updateBatDisplay() {
     int adcMv = analogReadMilliVolts(cfg.batAdcPin);
     int batMv = adcMv * 2;
     int pct   = constrain((int)(100.0f * (batMv - cfg.batMvEmpty) /
-                                (float)(cfg.batMvFull  - cfg.batMvEmpty)), 0, 100);
+                                (float)(cfg.batMvFull - cfg.batMvEmpty)), 0, 100);
     char buf[6]; snprintf(buf, sizeof(buf), "%3d%%", pct);
     gfx->fillRect(DISP_W - 44, Y_HDR, 42, 9, C_BG);
     uint16_t col = pct > 30 ? C_GREEN : (pct > 10 ? C_YELLOW : C_RED);
     gfx->setTextColor(col); gfx->setTextSize(1);
     gfx->setCursor(DISP_W - 42, Y_HDR); gfx->print(buf);
 }
-
-// Alt label + big number
 void updateAltDisplay(float aglFt) {
-    // Label: "FT AGL" when calibrated, "FT ABS" when raw
     gfx->fillRect(0, Y_ALT_LBL, DISP_W, 8, C_BG);
     centeredText(Y_ALT_LBL, 1, C_DKGRAY, cal.isValid() ? "FT  AGL" : "FT  ABS");
-
-    char buf[12];
-    uint16_t col;
+    char buf[12]; uint16_t col;
     if (cal.isValid()) {
         snprintf(buf, sizeof(buf), "%+.0f", aglFt);
-        col = aglFt >  1.0f ? C_GREEN
-            : aglFt < -1.0f ? C_RED
-            :                  C_WHITE;
+        col = aglFt >  1.0f ? C_GREEN : aglFt < -1.0f ? C_RED : C_WHITE;
     } else {
-        // No calibration: show raw absolute in feet, white
         snprintf(buf, sizeof(buf), "%.0f", aglFt);
         col = C_WHITE;
     }
     updateCentered(Y_ALT, 52, 6, col, buf);
 }
-
-void updateVsDisplay(float vsFpm, float vsMs) {
+void updateVsDisplay(float vsFps) {
     char buf[16];
-    snprintf(buf, sizeof(buf), "%+.0f fpm", vsFpm);
-    uint16_t col = fabsf(vsFpm) < cfg.vsDeadband ? C_GRAY
-                 : (vsFpm > 0)                    ? C_GREEN : C_RED;
+    float absVal = fabsf(vsFps);
+    if (absVal < 10.0f) snprintf(buf, sizeof(buf), "%+.1f fps", vsFps);
+    else                snprintf(buf, sizeof(buf), "%+.0f fps", vsFps);
+    uint16_t col = absVal < cfg.vsDeadbandFps ? C_GRAY
+                 : (vsFps > 0)                ? C_GREEN : C_RED;
     updateCentered(Y_VS, 26, 3, col, buf);
-
+    float vsMs = vsFps / 3.28084f;
     snprintf(buf, sizeof(buf), "%+.1f m/s", vsMs);
     updateCentered(Y_VS_SUB, 10, 1, C_DKGRAY, buf);
 }
-
 void updateStatusLine() {
-    if (cal.isValid()) {
+    if (logActive) {
+        uint32_t elapsed = (millis() - logStartMs) / 1000;
+        char buf[24];
+        snprintf(buf, sizeof(buf), "* REC %02u:%02u [%s]",
+                 (unsigned)(elapsed / 60), (unsigned)(elapsed % 60),
+                 logTrigger == TRIG_AUTO ? "AUTO" : "MAN");
+        updateCentered(Y_STATUS, 18, 1, C_RED, buf);
+    } else if (cal.isValid()) {
         updateCentered(Y_STATUS, 18, 2, C_CYAN, "READY");
     } else {
         updateCentered(Y_STATUS, 18, 1, C_YELLOW, "HOLD BOOT 2s TO CALIBRATE");
@@ -221,31 +261,25 @@ void updateStatusLine() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Calibration routines
-// Only these two functions may write cal.groundAltM / cal.source.
-// Jump logging must never call either of them.
+// Calibration — ONLY these functions write cal.groundAltM / cal.source
 // ═══════════════════════════════════════════════════════════════════════════
 void applyCalibration(float groundM, CalSource src) {
     cal.groundAltM = groundM;
     cal.source      = src;
-    vsIdx = 0; vsFull = false;   // reset vspeed so first post-cal reading is clean
+    vsIdx = 0; vsFull = false;
 }
-
 void doAutoCalibration() {
-    // Called once after boot sampling completes.
     float mn = bootBuf[0], mx = bootBuf[0], sum = 0.0f;
     for (uint8_t i = 0; i < cfg.autoCalSamples; i++) {
         mn   = min(mn, bootBuf[i]);
         mx   = max(mx, bootBuf[i]);
         sum += bootBuf[i];
     }
-    float variationM = mx - mn;
-
+    float variationM  = mx - mn;
     float variationFt = variationM * 3.28084f;
     Serial.printf("Auto-cal: variation=%.2fm (%.1fft), threshold=%.2fm (%.0fft)\n",
                   variationM, variationFt,
                   cfg.autoCalStableThresh, cfg.autoCalStableThresh * 3.28084f);
-
     if (variationM <= cfg.autoCalStableThresh) {
         applyCalibration(sum / cfg.autoCalSamples, CAL_AUTO);
         Serial.printf("Auto-cal OK: ground=%.2fm\n", cal.groundAltM);
@@ -253,16 +287,12 @@ void doAutoCalibration() {
         delay(2000);
     } else {
         Serial.printf("Auto-cal SKIPPED: not stable\n");
-        // Leave cal.source = CAL_NONE — show uncalibrated warning
         updateCentered(Y_ALT, 26, 1, C_YELLOW, "NOT CALIBRATED");
         updateCentered(Y_ALT + 28, 24, 1, C_YELLOW, "Hold BOOT on ground to set zero");
         delay(3000);
     }
 }
-
 void doManualCalibration() {
-    // Always succeeds — averages cfg.calAvgCount readings.
-    // This is the user override; works regardless of motion state.
     updateCentered(Y_ALT, 52, 3, C_YELLOW, "CAL...");
     float sum = 0.0f; int n = 0;
     for (int i = 0; i < cfg.calAvgCount; i++) {
@@ -275,22 +305,193 @@ void doManualCalibration() {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Boot sampling — feeds bootBuf until we have autoCalSamples readings,
-// then calls doAutoCalibration() and transitions to BOOT_RUNNING.
-// ═══════════════════════════════════════════════════════════════════════════
+// ─── Boot sampling ──────────────────────────────────────────────────────────
 void handleBootSample(float altM) {
     bootBuf[bootIdx++] = altM;
-
     char buf[20];
     snprintf(buf, sizeof(buf), "SAMPLING %d/%d", bootIdx, cfg.autoCalSamples);
     updateCentered(Y_ALT, 52, 2, C_YELLOW, buf);
-
     if (bootIdx >= cfg.autoCalSamples) {
         bootPhase = BOOT_RUNNING;
         doAutoCalibration();
         updateCalBadge();
         updateStatusLine();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// RTC (PCF85063 at 0x51)
+// ═══════════════════════════════════════════════════════════════════════════
+static bool rtcIsValid() {
+    return !(iicRead1(cfg.rtcAddr, 0x04) & 0x80);  // OS flag = oscillator-stop
+}
+static void rtcBuildFilename(char *buf, size_t n) {
+    if (rtcIsValid()) {
+        uint8_t regs[7];
+        if (iicReadBuf(cfg.rtcAddr, 0x04, regs, 7)) {
+            uint8_t sec = bcdDec(regs[0] & 0x7F);
+            uint8_t mn  = bcdDec(regs[1] & 0x7F);
+            uint8_t hr  = bcdDec(regs[2] & 0x3F);
+            uint8_t day = bcdDec(regs[3] & 0x3F);
+            // regs[4] = weekday (skip)
+            uint8_t mo  = bcdDec(regs[5] & 0x1F);
+            uint8_t yr  = bcdDec(regs[6]);
+            snprintf(buf, n, "/jump_20%02d-%02d-%02d_%02d%02d%02d.csv",
+                     yr, mo, day, hr, mn, sec);
+            return;
+        }
+    }
+    snprintf(buf, n, "/jump_t%lu.csv", (unsigned long)(millis() / 1000));
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Rolling pre-jump buffer (300 samples × 32 B = 9.4 KB)
+// ═══════════════════════════════════════════════════════════════════════════
+static void rollPush(const Sample &s) {
+    rollBuf[rollHead] = s;
+    rollHead = (rollHead + 1) % ROLL_SIZE;
+    if (rollCount < ROLL_SIZE) rollCount++;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Jump log — NEVER touches cal.groundAltM or cal.source
+// ═══════════════════════════════════════════════════════════════════════════
+static void rollFlushToFile() {
+    uint16_t count = rollCount;
+    uint16_t start = (count == ROLL_SIZE) ? rollHead : 0;
+    for (uint16_t i = 0; i < count; i++) {
+        const Sample &s = rollBuf[(start + i) % ROLL_SIZE];
+        logFile.printf("%lu,%.1f,%.2f,%.2f,%.1f,%.3f,%.3f,%.3f\n",
+                       (unsigned long)s.time_ms,
+                       s.agl_ft, s.vspeed_fps, s.pressure_hpa, s.temp_c,
+                       s.ax, s.ay, s.az);
+        logSampleCount++;
+    }
+    logFile.flush();
+    Serial.printf("Roll buffer flushed: %u pre-samples\n", (unsigned)logSampleCount);
+}
+
+static void writeSampleToLog(const Sample &s) {
+    if (!logActive) return;
+    logFile.printf("%lu,%.1f,%.2f,%.2f,%.1f,%.3f,%.3f,%.3f\n",
+                   (unsigned long)s.time_ms,
+                   s.agl_ft, s.vspeed_fps, s.pressure_hpa, s.temp_c,
+                   s.ax, s.ay, s.az);
+    logSampleCount++;
+    if (logSampleCount % 50 == 0) {
+        logFile.flush();
+        Serial.printf("Log: %lu samples\n", (unsigned long)logSampleCount);
+    }
+}
+
+void startLog(LogTrigger trigger) {
+    if (logActive) return;
+    char filename[40];
+    rtcBuildFilename(filename, sizeof(filename));
+    logFile = LittleFS.open(filename, "w");
+    if (!logFile) {
+        Serial.printf("LOG FAIL: cannot open %s\n", filename);
+        return;
+    }
+    logSampleCount = 0;
+    logFile.println("time_ms,agl_ft,vspeed_fps,pressure_hpa,temp_c,ax,ay,az");
+    if (trigger == TRIG_AUTO) rollFlushToFile();
+    logActive  = true;
+    logTrigger = trigger;
+    logStartMs = millis();
+    Serial.printf("Log START [%s]: %s\n",
+                  trigger == TRIG_AUTO ? "AUTO" : "MAN", filename);
+    updateStatusLine();
+}
+
+void stopLog() {
+    if (!logActive) return;
+    logFile.flush();
+    logFile.close();
+    logActive = false;
+    Serial.printf("Log STOP: %lu samples total\n", (unsigned long)logSampleCount);
+    updateStatusLine();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// IMU (QMI8658 at 0x6B)
+// ═══════════════════════════════════════════════════════════════════════════
+static void initIMU() {
+    uint8_t who = iicRead1(cfg.imuAddr, 0x00);
+    Serial.printf("QMI8658 WHO_AM_I=0x%02X\n", who);
+    iicWrite(cfg.imuAddr, 0x02, 0x40);  // CTRL1: addr auto-increment
+    iicWrite(cfg.imuAddr, 0x03, 0x28);  // CTRL2: ±8g, ~31 Hz ODR
+    iicWrite(cfg.imuAddr, 0x08, 0x01);  // CTRL7: enable accelerometer
+}
+static void readIMU() {
+    uint8_t buf[6];
+    if (!iicReadBuf(cfg.imuAddr, 0x35, buf, 6)) return;
+    int16_t ax = (int16_t)((uint16_t)buf[1] << 8 | buf[0]);
+    int16_t ay = (int16_t)((uint16_t)buf[3] << 8 | buf[2]);
+    int16_t az = (int16_t)((uint16_t)buf[5] << 8 | buf[4]);
+    const float scale = 8.0f / 32768.0f;
+    imuAx = ax * scale;
+    imuAy = ay * scale;
+    imuAz = az * scale;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Auto-start / auto-stop — never touches cal state
+// ═══════════════════════════════════════════════════════════════════════════
+static void checkAutoTriggers(float vsFps, float aglFt, uint32_t now) {
+    if (!logActive) {
+        if (vsFps <= cfg.autoStartFps) {
+            if (autoStartSustainMs == 0) autoStartSustainMs = now;
+            if ((now - autoStartSustainMs) >= (uint32_t)(cfg.autoStartSustainSec * 1000.0f)) {
+                startLog(TRIG_AUTO);
+                autoStartSustainMs = 0;
+            }
+        } else {
+            autoStartSustainMs = 0;
+        }
+    } else {
+        if (vsFps > cfg.autoStopFps) {
+            if (autoStopSustainMs == 0) {
+                autoStopSustainMs = now;
+                autoStopRefAlt    = aglFt;
+            } else if (fabsf(aglFt - autoStopRefAlt) > cfg.autoStopAltStabFt) {
+                autoStopSustainMs = now;
+                autoStopRefAlt    = aglFt;
+            } else if ((now - autoStopSustainMs) >= (uint32_t)(cfg.autoStopSustainSec * 1000.0f)) {
+                stopLog();
+                autoStopSustainMs = 0;
+            }
+        } else {
+            autoStopSustainMs = 0;
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Button — short press (<1 s on release) = toggle log
+//           long  press (≥2 s on hold)   = manual calibration
+// ═══════════════════════════════════════════════════════════════════════════
+static void handleButton() {
+    bool btnDown = (digitalRead(BTN_PIN) == LOW);
+    if (btnDown && !btnWasDown) {
+        btnPressStart = millis(); btnWasDown = true; longFired = false;
+        return;
+    }
+    if (btnDown && btnWasDown && !longFired) {
+        if (millis() - btnPressStart >= cfg.calPressMs) {
+            longFired = true;
+            doManualCalibration();
+            updateCalBadge();
+            updateStatusLine();
+        }
+        return;
+    }
+    if (!btnDown && btnWasDown) {
+        uint32_t held = millis() - btnPressStart;
+        btnWasDown = false;
+        if (!longFired && held < cfg.shortPressMaxMs) {
+            if (logActive) stopLog(); else startLog(TRIG_MANUAL);
+        }
     }
 }
 
@@ -306,10 +507,9 @@ void setup() {
     pinMode(LCD_BL, OUTPUT); digitalWrite(LCD_BL, HIGH);
     gfx->begin();
     drawStaticUI();
-    updateCalBadge();   // shows [UNCAL] until sampling completes
+    updateCalBadge();
     updateBatDisplay();
     updateStatusLine();
-
     centeredText(Y_ALT_LBL, 1, C_DKGRAY, "AUTO-CAL IN 5s...");
 
     pinMode(BTN_PIN, INPUT_PULLUP);
@@ -325,82 +525,92 @@ void setup() {
     bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
     bmp.setOutputDataRate(BMP3_ODR_50_HZ);
 
-    // Warm up the IIR filter before boot sampling begins.
-    // IIR coeff 3 needs ~8 readings to settle from a cold start; the first
-    // few samples after power-on are significantly off, which would push the
-    // stability variance above the 10 ft threshold and cause auto-cal to fail.
     Serial.println("Warming up BMP390 IIR filter...");
     for (int i = 0; i < 8; i++) { bmp.performReading(); delay(100); }
 
-    Serial.println("AltiWatch — collecting boot samples for auto-cal...");
+    initIMU();
+
+    if (!LittleFS.begin(true)) {
+        Serial.println("WARNING: LittleFS mount failed — logging disabled");
+    } else {
+        Serial.printf("LittleFS: %u / %u bytes used\n",
+                      LittleFS.usedBytes(), LittleFS.totalBytes());
+    }
+
+    Serial.println("AltiWatch stage 5 — collecting boot samples...");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// loop
+// loop — 10 Hz samples, 2 Hz display
 // ═══════════════════════════════════════════════════════════════════════════
 void loop() {
-    // ── Button (active during RUNNING only; ignored during SAMPLING) ─────
-    if (bootPhase == BOOT_RUNNING) {
-        bool btnDown = (digitalRead(BTN_PIN) == LOW);
-        if (btnDown && !btnWasDown) {
-            btnPressStart = millis(); btnWasDown = true; longFired = false;
-        } else if (!btnDown) {
-            btnWasDown = false; longFired = false;
-        }
-        if (btnDown && !longFired && (millis() - btnPressStart >= cfg.calPressMs)) {
-            longFired = true;
-            doManualCalibration();
-            updateCalBadge();
-            updateStatusLine();
-        }
-    }
+    uint32_t now = millis();
 
-    // ── Sensor read ──────────────────────────────────────────────────────
-    if (!bmp.performReading()) { delay(500); return; }
-    float absAltM  = bmp.readAltitude(cfg.seaLevelHpa);
-    float pressHpa = bmp.pressure / 100.0f;
-    float tempC    = bmp.temperature;
-    uint32_t now   = millis();
+    if (bootPhase == BOOT_RUNNING) handleButton();
 
-    // ── Boot sampling phase ──────────────────────────────────────────────
+    // ── Boot sampling (500 ms interval) ───────────────────────────────────
     if (bootPhase == BOOT_SAMPLING) {
-        handleBootSample(absAltM);
-        delay(500);
+        if (now - lastBootMs < 500) return;
+        lastBootMs = now;
+        if (!bmp.performReading()) return;
+        handleBootSample(bmp.readAltitude(cfg.seaLevelHpa));
         return;
     }
 
-    // ── Vertical speed ───────────────────────────────────────────────────
-    vsAlt[vsIdx] = absAltM; vsTime[vsIdx] = now;
+    // ── 10 Hz sample tick ─────────────────────────────────────────────────
+    if (now - lastSampleMs < 100) return;
+    lastSampleMs = now;
+
+    if (!bmp.performReading()) return;
+    float absAltM  = bmp.readAltitude(cfg.seaLevelHpa);
+    float pressHpa = bmp.pressure / 100.0f;
+    float tempC    = bmp.temperature;
+
+    readIMU();
+
+    // ── Vertical speed (8-slot ring, ft/s) ────────────────────────────────
+    vsAlt[vsIdx]  = absAltM;
+    vsTime[vsIdx] = now;
     vsIdx = (vsIdx + 1) % VS_SLOTS;
     if (vsIdx == 0) vsFull = true;
 
-    float vsMs = 0.0f, vsFpm = 0.0f;
+    float vsFps = 0.0f;
     if (vsFull || vsIdx >= 2) {
         uint8_t oldest = vsFull ? vsIdx : 0;
-        uint8_t newest = vsIdx == 0 ? VS_SLOTS - 1 : vsIdx - 1;
+        uint8_t newest = (vsIdx == 0) ? VS_SLOTS - 1 : vsIdx - 1;
         float dAlt  = vsAlt[newest]  - vsAlt[oldest];
         float dTime = (vsTime[newest] - vsTime[oldest]) / 1000.0f;
-        if (dTime > 0.1f) {
-            vsMs  = dAlt / dTime;
-            vsFpm = vsMs * 3.28084f * 60.0f;
-            if (fabsf(vsFpm) < cfg.vsDeadband) { vsMs = 0.0f; vsFpm = 0.0f; }
+        if (dTime > 0.05f) {
+            vsFps = (dAlt / dTime) * 3.28084f;
+            if (fabsf(vsFps) < cfg.vsDeadbandFps) vsFps = 0.0f;
         }
     }
 
-    // ── AGL / ABS altitude ───────────────────────────────────────────────
+    // ── AGL / ABS altitude ────────────────────────────────────────────────
     float dispAltM  = cal.isValid() ? (absAltM - cal.groundAltM) : absAltM;
     float dispAltFt = dispAltM * 3.28084f;
 
-    // ── Serial (pressure + temp kept for logging even though off display) ─
-    Serial.printf("%s %+.0fft  %+.0ffpm  %.2fhPa  %.1fC\n",
+    // ── Build sample, push to rolling buffer ──────────────────────────────
+    Sample s = { now, dispAltFt, vsFps, pressHpa, tempC, imuAx, imuAy, imuAz };
+    rollPush(s);
+    if (logActive) writeSampleToLog(s);
+
+    checkAutoTriggers(vsFps, dispAltFt, now);
+
+    // ── Serial ────────────────────────────────────────────────────────────
+    Serial.printf("%s %+.0fft  %+.1ffps  %.2fhPa  %.1fC  [%.2f,%.2f,%.2f]g%s\n",
                   cal.source == CAL_AUTO   ? "[A]" :
                   cal.source == CAL_MANUAL ? "[M]" : "[?]",
-                  dispAltFt, vsFpm, pressHpa, tempC);
+                  dispAltFt, vsFps, pressHpa, tempC,
+                  imuAx, imuAy, imuAz,
+                  logActive ? "  REC" : "");
 
-    // ── Display ──────────────────────────────────────────────────────────
-    updateAltDisplay(dispAltFt);
-    updateVsDisplay(vsFpm, vsMs);
-    updateBatDisplay();
-
-    delay(500);
+    // ── 2 Hz display refresh ──────────────────────────────────────────────
+    if (now - lastDisplayMs >= 500) {
+        lastDisplayMs = now;
+        updateAltDisplay(dispAltFt);
+        updateVsDisplay(vsFps);
+        updateBatDisplay();
+        updateStatusLine();
+    }
 }
