@@ -100,6 +100,7 @@ static uint32_t   logSampleCount = 0;
 #define I2C_SDA   11
 #define I2C_SCL   10
 #define BTN_PIN    0
+#define LED_TEST_PIN 15  // S8050 base driver — Stage 7 blink test
 
 // ─── Colours (RGB565) ────────────────────────────────────────────────────────
 #define C_BG      0x0000
@@ -146,6 +147,10 @@ static uint32_t lastBootMs    = 0;
 static uint32_t autoStartSustainMs = 0;
 static uint32_t autoStopSustainMs  = 0;
 static float    autoStopRefAlt     = 0.0f;
+
+// ─── LED blink test (Stage 7) ────────────────────────────────────────────────
+static uint32_t lastLedMs  = 0;
+static bool     ledState   = false;
 
 // ─── Alert flash state ───────────────────────────────────────────────────────
 enum AlertState { ALERT_OFF, ALERT_ON };
@@ -643,6 +648,8 @@ void setup() {
     centeredText(Y_ALT_LBL, 1, C_DKGRAY, "AUTO-CAL IN 5s...");
 
     pinMode(BTN_PIN, INPUT_PULLUP);
+    pinMode(LED_TEST_PIN, OUTPUT);
+    digitalWrite(LED_TEST_PIN, LOW);
     Wire.begin(I2C_SDA, I2C_SCL);
 
     if (!bmp.begin_I2C(cfg.bmpAddr, &Wire)) {
@@ -678,6 +685,14 @@ void loop() {
 
     if (bootPhase == BOOT_RUNNING) handleButton();
     handleSerialInput();
+
+    // ── LED blink test — 1 Hz (500 ms on / 500 ms off) ───────────────────
+    if (now - lastLedMs >= 500) {
+        lastLedMs = now;
+        ledState  = !ledState;
+        digitalWrite(LED_TEST_PIN, ledState ? HIGH : LOW);
+        Serial.println(ledState ? "IO15 HIGH" : "IO15 LOW");
+    }
 
     // ── Boot sampling (500 ms interval) ───────────────────────────────────
     if (bootPhase == BOOT_SAMPLING) {
