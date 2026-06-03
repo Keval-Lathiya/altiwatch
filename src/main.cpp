@@ -179,6 +179,7 @@ static volatile bool bleCmd_startLog  = false;
 static volatile bool bleCmd_stopLog   = false;
 static volatile bool bleCmd_setRTC       = false;
 static volatile bool bleCmd_factoryReset = false;
+static volatile bool settingsDirty       = false;  // set by BLE callbacks, saved by main loop
 static uint8_t bleRtcYr = 0, bleRtcMo = 1, bleRtcDay = 1;
 static uint8_t bleRtcHr = 0, bleRtcMn = 0, bleRtcSec = 0;
 
@@ -772,24 +773,32 @@ static void handleButton() {
 #define BLE_C024 "A1710024-0000-0000-0000-000000000000"
 #define BLE_C025 "A1710025-0000-0000-0000-000000000000"
 
-// ── NVS helpers (namespace "altiwatch") ──────────────────────────────────────
-static void nvsSaveU16(const char *key, uint16_t v) {
-    Preferences p; p.begin("altiwatch", false); p.putUShort(key, v); p.end();
-}
-static void nvsSaveU8(const char *key, uint8_t v) {
-    Preferences p; p.begin("altiwatch", false); p.putUChar(key, v); p.end();
-}
+// ── NVS load / save — always called from the main task, never from BLE task ──
 static void loadSettings() {
     Preferences p;
     p.begin("altiwatch", true);  // read-only
-    if (p.isKey("alertStart")) cfg.alertStartFt    = (float)p.getUShort("alertStart");
-    if (p.isKey("alertStop"))  cfg.alertStopFt     = (float)p.getUShort("alertStop");
-    if (p.isKey("alertsEn"))   cfg.alertsEnabled   = p.getUChar("alertsEn")  != 0;
-    if (p.isKey("vibEn"))      cfg.vibrationEnabled = p.getUChar("vibEn")    != 0;
-    if (p.isKey("autoLogEn"))  cfg.autoLogEnabled  = p.getUChar("autoLogEn") != 0;
-    if (p.isKey("units"))      cfg.units           = p.getUChar("units");
+    if (p.isKey("alertStart")) cfg.alertStartFt     = (float)p.getUShort("alertStart");
+    if (p.isKey("alertStop"))  cfg.alertStopFt      = (float)p.getUShort("alertStop");
+    if (p.isKey("alertsEn"))   cfg.alertsEnabled    = p.getUChar("alertsEn")  != 0;
+    if (p.isKey("vibEn"))      cfg.vibrationEnabled = p.getUChar("vibEn")     != 0;
+    if (p.isKey("autoLogEn"))  cfg.autoLogEnabled   = p.getUChar("autoLogEn") != 0;
+    if (p.isKey("units"))      cfg.units            = p.getUChar("units");
     p.end();
-    Serial.printf("[NVS] alertStart=%.0f alertStop=%.0f alertsEn=%d vibEn=%d autoLogEn=%d units=%d\n",
+    Serial.printf("[NVS load] alertStart=%.0f alertStop=%.0f alertsEn=%d vibEn=%d autoLogEn=%d units=%d\n",
+                  cfg.alertStartFt, cfg.alertStopFt,
+                  cfg.alertsEnabled, cfg.vibrationEnabled, cfg.autoLogEnabled, cfg.units);
+}
+static void saveSettings() {
+    Preferences p;
+    p.begin("altiwatch", false);  // read-write
+    p.putUShort("alertStart", (uint16_t)cfg.alertStartFt);
+    p.putUShort("alertStop",  (uint16_t)cfg.alertStopFt);
+    p.putUChar("alertsEn",    cfg.alertsEnabled    ? 1 : 0);
+    p.putUChar("vibEn",       cfg.vibrationEnabled ? 1 : 0);
+    p.putUChar("autoLogEn",   cfg.autoLogEnabled   ? 1 : 0);
+    p.putUChar("units",       cfg.units);
+    p.end();
+    Serial.printf("[NVS save] alertStart=%.0f alertStop=%.0f alertsEn=%d vibEn=%d autoLogEn=%d units=%d\n",
                   cfg.alertStartFt, cfg.alertStopFt,
                   cfg.alertsEnabled, cfg.vibrationEnabled, cfg.autoLogEnabled, cfg.units);
 }
@@ -801,14 +810,16 @@ class AW_ServerCB : public NimBLEServerCallbacks {
         NimBLEDevice::startAdvertising();
     }
 };
+// BLE callbacks: update cfg + print, then set dirty flag.
+// NVS write happens in main loop via saveSettings() — never from BLE task.
 class CB_AlertStart : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *p) override {
         if (p->getValue().size() >= 2) {
             uint16_t v; memcpy(&v, p->getValue().data(), 2);
             float old = cfg.alertStartFt;
             cfg.alertStartFt = (float)v;
-            nvsSaveU16("alertStart", v);
-            Serial.printf("[BLE] alertStartFt: %.0f -> %.0f (saved)\n", old, cfg.alertStartFt);
+            settingsDirty = true;
+            Serial.printf("[BLE] alertStartFt: %.0f -> %.0f\n", old, cfg.alertStartFt);
         }
     }
 };
@@ -818,8 +829,8 @@ class CB_AlertStop : public NimBLECharacteristicCallbacks {
             uint16_t v; memcpy(&v, p->getValue().data(), 2);
             float old = cfg.alertStopFt;
             cfg.alertStopFt = (float)v;
-            nvsSaveU16("alertStop", v);
-            Serial.printf("[BLE] alertStopFt: %.0f -> %.0f (saved)\n", old, cfg.alertStopFt);
+            settingsDirty = true;
+            Serial.printf("[BLE] alertStopFt: %.0f -> %.0f\n", old, cfg.alertStopFt);
         }
     }
 };
@@ -828,8 +839,8 @@ class CB_AlertsEn : public NimBLECharacteristicCallbacks {
         if (p->getValue().size() >= 1) {
             bool old = cfg.alertsEnabled;
             cfg.alertsEnabled = p->getValue()[0] != 0;
-            nvsSaveU8("alertsEn", cfg.alertsEnabled ? 1 : 0);
-            Serial.printf("[BLE] alertsEnabled: %d -> %d (saved)\n", old, cfg.alertsEnabled);
+            settingsDirty = true;
+            Serial.printf("[BLE] alertsEnabled: %d -> %d\n", old, cfg.alertsEnabled);
         }
     }
 };
@@ -838,8 +849,8 @@ class CB_VibEn : public NimBLECharacteristicCallbacks {
         if (p->getValue().size() >= 1) {
             bool old = cfg.vibrationEnabled;
             cfg.vibrationEnabled = p->getValue()[0] != 0;
-            nvsSaveU8("vibEn", cfg.vibrationEnabled ? 1 : 0);
-            Serial.printf("[BLE] vibrationEnabled: %d -> %d (saved)\n", old, cfg.vibrationEnabled);
+            settingsDirty = true;
+            Serial.printf("[BLE] vibrationEnabled: %d -> %d\n", old, cfg.vibrationEnabled);
         }
     }
 };
@@ -848,8 +859,8 @@ class CB_AutoLogEn : public NimBLECharacteristicCallbacks {
         if (p->getValue().size() >= 1) {
             bool old = cfg.autoLogEnabled;
             cfg.autoLogEnabled = p->getValue()[0] != 0;
-            nvsSaveU8("autoLogEn", cfg.autoLogEnabled ? 1 : 0);
-            Serial.printf("[BLE] autoLogEnabled: %d -> %d (saved)\n", old, cfg.autoLogEnabled);
+            settingsDirty = true;
+            Serial.printf("[BLE] autoLogEnabled: %d -> %d\n", old, cfg.autoLogEnabled);
         }
     }
 };
@@ -858,8 +869,8 @@ class CB_Units : public NimBLECharacteristicCallbacks {
         if (p->getValue().size() >= 1) {
             uint8_t old = cfg.units;
             cfg.units = p->getValue()[0] & 1;
-            nvsSaveU8("units", cfg.units);
-            Serial.printf("[BLE] units: %d -> %d (saved)\n", old, cfg.units);
+            settingsDirty = true;
+            Serial.printf("[BLE] units: %d -> %d\n", old, cfg.units);
         }
     }
 };
@@ -1129,15 +1140,20 @@ void loop() {
     }
     if (bleCmd_factoryReset) {
         bleCmd_factoryReset = false;
+        settingsDirty = false;  // don't save defaults back over the cleared NVS
         Preferences p; p.begin("altiwatch", false); p.clear(); p.end();
         Settings defaults;
-        cfg.alertStartFt    = defaults.alertStartFt;
-        cfg.alertStopFt     = defaults.alertStopFt;
-        cfg.alertsEnabled   = defaults.alertsEnabled;
+        cfg.alertStartFt     = defaults.alertStartFt;
+        cfg.alertStopFt      = defaults.alertStopFt;
+        cfg.alertsEnabled    = defaults.alertsEnabled;
         cfg.vibrationEnabled = defaults.vibrationEnabled;
-        cfg.autoLogEnabled  = defaults.autoLogEnabled;
-        cfg.units           = defaults.units;
+        cfg.autoLogEnabled   = defaults.autoLogEnabled;
+        cfg.units            = defaults.units;
         Serial.println("[BLE] Factory reset: NVS cleared, firmware defaults restored");
+    }
+    if (settingsDirty) {
+        settingsDirty = false;
+        saveSettings();  // runs on main task — NVS writes are safe here
     }
 
     // ── Serial ────────────────────────────────────────────────────────────
