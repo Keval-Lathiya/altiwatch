@@ -568,50 +568,49 @@ static void cmdDump() {
 }
 
 static void cmdStatus() {
-    Serial.println(F("===== STATUS ====="));
-
-    Serial.println(F("-- Live cfg --"));
+    // Decode raw bytes manually — avoids packed-struct unaligned access on Xtensa
+    Serial.println("===== STATUS =====");
+    Serial.println("-- Live cfg --");
     Serial.printf("  alertStartFt:     %.0f\n",  cfg.alertStartFt);
     Serial.printf("  alertStopFt:      %.0f\n",  cfg.alertStopFt);
     Serial.printf("  alertsEnabled:    %d\n",    (int)cfg.alertsEnabled);
     Serial.printf("  vibrationEnabled: %d\n",    (int)cfg.vibrationEnabled);
     Serial.printf("  autoLogEnabled:   %d\n",    (int)cfg.autoLogEnabled);
     Serial.printf("  units:            %d (%s)\n", cfg.units, cfg.units ? "m/ms" : "ft/fps");
-
-    Serial.println(F("-- Calibration --"));
+    Serial.println("-- Calibration --");
     Serial.printf("  source:     %s\n", cal.source == CAL_AUTO   ? "AUTO"   :
                                         cal.source == CAL_MANUAL ? "MANUAL" : "NONE");
     Serial.printf("  groundAltM: %.2f\n", cal.groundAltM);
-
-    Serial.println(F("-- /settings.bin --"));
+    Serial.println("-- /settings.bin --");
     File f = LittleFS.open(SETTINGS_FILE, "r");
     if (!f) {
-        Serial.println(F("  (file not found — no BLE write has been saved yet)"));
+        Serial.println("  (file not found — no BLE write saved yet)");
     } else {
-        uint8_t raw[16];
+        uint8_t raw[16] = {0};
         size_t  n = f.read(raw, sizeof(raw));
         f.close();
         Serial.printf("  size: %u bytes\n", (unsigned)n);
-        Serial.print(F("  raw:  "));
+        Serial.print("  raw:  ");
         for (size_t i = 0; i < n; i++) Serial.printf("%02X ", raw[i]);
         Serial.println();
-        if (n >= sizeof(SettingsBlob)) {
-            SettingsBlob b;
-            memcpy(&b, raw, sizeof(b));
-            Serial.printf("  magic:      0x%02X (%s)\n", b.magic,
-                          b.magic == SETTINGS_MAGIC ? "ok" : "BAD — file ignored on load");
-            Serial.printf("  alertStart: %u\n",  (unsigned)b.alertStartFt);
-            Serial.printf("  alertStop:  %u\n",  (unsigned)b.alertStopFt);
-            Serial.printf("  alertsEn:   %u\n",  (unsigned)b.alertsEnabled);
-            Serial.printf("  vibEn:      %u\n",  (unsigned)b.vibrationEnabled);
-            Serial.printf("  autoLogEn:  %u\n",  (unsigned)b.autoLogEnabled);
-            Serial.printf("  units:      %u\n",  (unsigned)b.units);
+        if (n >= 9) {
+            // Decode byte-by-byte — no packed-struct cast
+            uint8_t  magic  = raw[0];
+            uint16_t aStart = (uint16_t)raw[1] | ((uint16_t)raw[2] << 8);
+            uint16_t aStop  = (uint16_t)raw[3] | ((uint16_t)raw[4] << 8);
+            Serial.printf("  magic:      0x%02X (%s)\n", magic,
+                          magic == SETTINGS_MAGIC ? "ok" : "BAD");
+            Serial.printf("  alertStart: %u\n",  (unsigned)aStart);
+            Serial.printf("  alertStop:  %u\n",  (unsigned)aStop);
+            Serial.printf("  alertsEn:   %u\n",  (unsigned)raw[5]);
+            Serial.printf("  vibEn:      %u\n",  (unsigned)raw[6]);
+            Serial.printf("  autoLogEn:  %u\n",  (unsigned)raw[7]);
+            Serial.printf("  units:      %u\n",  (unsigned)raw[8]);
         } else {
-            Serial.printf("  (truncated: got %u bytes, expected %u)\n",
-                          (unsigned)n, (unsigned)sizeof(SettingsBlob));
+            Serial.printf("  (truncated: %u bytes, expected 9)\n", (unsigned)n);
         }
     }
-    Serial.println(F("=================="));
+    Serial.println("==================");
 }
 
 static void handleSerialCmd(const char *cmd) {
