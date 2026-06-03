@@ -3,6 +3,7 @@
 #include <Wire.h>
 #include <Adafruit_BMP3XX.h>
 #include <LittleFS.h>
+#include <NimBLEDevice.h>
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Settings — single source of truth. BLE-ready: serialise this struct.
@@ -57,6 +58,12 @@ struct Settings {
 
     // Vibration motor (GPIO15 via S8050 driver)
     bool    vibrationEnabled     = true;
+
+    // Auto jump logging (BLE-toggleable)
+    bool    autoLogEnabled       = true;
+
+    // Display units: 0 = ft/fps,  1 = m/m·s⁻¹
+    uint8_t units                = 0;
 } cfg;
 
 // ─── Calibration ────────────────────────────────────────────────────────────
@@ -94,15 +101,15 @@ static LogTrigger logTrigger     = TRIG_MANUAL;
 static uint32_t   logSampleCount = 0;
 
 // ─── Hardware pins ───────────────────────────────────────────────────────────
-#define LCD_SCK   40
-#define LCD_MOSI  45
-#define LCD_CS    42
-#define LCD_DC    41
-#define LCD_RST   39
-#define LCD_BL     5
-#define I2C_SDA   11
-#define I2C_SCL   10
-#define BTN_PIN    0
+#define LCD_SCK      40
+#define LCD_MOSI     45
+#define LCD_CS       42
+#define LCD_DC       41
+#define LCD_RST      39
+#define LCD_BL        5
+#define I2C_SDA      11
+#define I2C_SCL      10
+#define BTN_PIN       0
 #define MOTOR_PIN    15  // S8050 base driver — vibration motor
 
 // ─── Colours (RGB565) ────────────────────────────────────────────────────────
@@ -161,6 +168,25 @@ static uint32_t   lastFlashMs = 0;
 static bool       flashRed    = false;
 static float      cachedAltFt = 0.0f;  // updated each 10Hz tick
 static float      cachedVsFps = 0.0f;
+
+// ─── BLE state ───────────────────────────────────────────────────────────────
+static volatile bool bleConnected    = false;
+static volatile bool bleStateChanged = false;
+// Command flags — set from BLE task, consumed in main loop
+static volatile bool bleCmd_calibrate = false;
+static volatile bool bleCmd_startLog  = false;
+static volatile bool bleCmd_stopLog   = false;
+static volatile bool bleCmd_setRTC    = false;
+static uint8_t bleRtcYr = 0, bleRtcMo = 1, bleRtcDay = 1;
+static uint8_t bleRtcHr = 0, bleRtcMn = 0, bleRtcSec = 0;
+
+static NimBLECharacteristic *pAltChar      = nullptr;
+static NimBLECharacteristic *pVsChar       = nullptr;
+static NimBLECharacteristic *pBatChar      = nullptr;
+static NimBLECharacteristic *pCalChar      = nullptr;
+static NimBLECharacteristic *pLogStateChar = nullptr;
+static NimBLECharacteristic *pLogDurChar   = nullptr;
+static NimBLECharacteristic *pRtcChar      = nullptr;
 
 Arduino_DataBus *bus = new Arduino_ESP32SPI(LCD_DC, LCD_CS, LCD_SCK, LCD_MOSI, GFX_NOT_DEFINED);
 Arduino_GFX    *gfx  = new Arduino_ST7789(bus, LCD_RST, 0, true, DISP_W, DISP_H);
@@ -230,6 +256,13 @@ void updateCalBadge() {
             gfx->setCursor(96, Y_HDR);   gfx->print("[UNCAL]");      break;
     }
 }
+void updateBLEBadge() {
+    gfx->fillRect(58, Y_HDR, 22, 9, C_BG);
+    if (bleConnected) {
+        gfx->setTextColor(C_CYAN); gfx->setTextSize(1);
+        gfx->setCursor(60, Y_HDR); gfx->print("BLE");
+    }
+}
 void updateBatDisplay() {
     int adcMv = analogReadMilliVolts(cfg.batAdcPin);
     int batMv = adcMv * 2;
@@ -243,28 +276,50 @@ void updateBatDisplay() {
 }
 void updateAltDisplay(float aglFt) {
     gfx->fillRect(0, Y_ALT_LBL, DISP_W, 8, C_BG);
-    centeredText(Y_ALT_LBL, 1, C_DKGRAY, cal.isValid() ? "FT  AGL" : "FT  ABS");
     char buf[12]; uint16_t col;
-    if (cal.isValid()) {
-        snprintf(buf, sizeof(buf), "%+.0f", aglFt);
-        col = aglFt >  1.0f ? C_GREEN : aglFt < -1.0f ? C_RED : C_WHITE;
+    if (cfg.units == 0) {
+        centeredText(Y_ALT_LBL, 1, C_DKGRAY, cal.isValid() ? "FT  AGL" : "FT  ABS");
+        if (cal.isValid()) {
+            snprintf(buf, sizeof(buf), "%+.0f", aglFt);
+            col = aglFt >  1.0f ? C_GREEN : aglFt < -1.0f ? C_RED : C_WHITE;
+        } else {
+            snprintf(buf, sizeof(buf), "%.0f", aglFt);
+            col = C_WHITE;
+        }
     } else {
-        snprintf(buf, sizeof(buf), "%.0f", aglFt);
-        col = C_WHITE;
+        float aglM = aglFt / 3.28084f;
+        centeredText(Y_ALT_LBL, 1, C_DKGRAY, cal.isValid() ? "M   AGL" : "M   ABS");
+        if (cal.isValid()) {
+            snprintf(buf, sizeof(buf), "%+.0f", aglM);
+            col = aglM >  0.3f ? C_GREEN : aglM < -0.3f ? C_RED : C_WHITE;
+        } else {
+            snprintf(buf, sizeof(buf), "%.0f", aglM);
+            col = C_WHITE;
+        }
     }
     updateCentered(Y_ALT, 52, 6, col, buf);
 }
 void updateVsDisplay(float vsFps) {
     char buf[16];
     float absVal = fabsf(vsFps);
-    if (absVal < 10.0f) snprintf(buf, sizeof(buf), "%+.1f fps", vsFps);
-    else                snprintf(buf, sizeof(buf), "%+.0f fps", vsFps);
     uint16_t col = absVal < cfg.vsDeadbandFps ? C_GRAY
                  : (vsFps > 0)                ? C_GREEN : C_RED;
-    updateCentered(Y_VS, 26, 3, col, buf);
-    float vsMs = vsFps / 3.28084f;
-    snprintf(buf, sizeof(buf), "%+.1f m/s", vsMs);
-    updateCentered(Y_VS_SUB, 10, 1, C_DKGRAY, buf);
+    if (cfg.units == 0) {
+        if (absVal < 10.0f) snprintf(buf, sizeof(buf), "%+.1f fps", vsFps);
+        else                snprintf(buf, sizeof(buf), "%+.0f fps", vsFps);
+        updateCentered(Y_VS, 26, 3, col, buf);
+        float vsMs = vsFps / 3.28084f;
+        snprintf(buf, sizeof(buf), "%+.1f m/s", vsMs);
+        updateCentered(Y_VS_SUB, 10, 1, C_DKGRAY, buf);
+    } else {
+        float vsMs = vsFps / 3.28084f;
+        float absMs = fabsf(vsMs);
+        if (absMs < 3.0f) snprintf(buf, sizeof(buf), "%+.1f m/s", vsMs);
+        else              snprintf(buf, sizeof(buf), "%+.0f m/s", vsMs);
+        updateCentered(Y_VS, 26, 3, col, buf);
+        snprintf(buf, sizeof(buf), "%+.1f fps", vsFps);
+        updateCentered(Y_VS_SUB, 10, 1, C_DKGRAY, buf);
+    }
 }
 void updateStatusLine() {
     if (logActive) {
@@ -364,6 +419,19 @@ static void rtcBuildFilename(char *buf, size_t n) {
     }
     snprintf(buf, n, "/jump_t%lu.csv", (unsigned long)(millis() / 1000));
 }
+static void rtcSetTime(uint8_t yr, uint8_t mo, uint8_t day,
+                        uint8_t hr, uint8_t mn, uint8_t sec) {
+    Wire.beginTransmission(cfg.rtcAddr);
+    Wire.write(0x04);
+    Wire.write((((sec/10)<<4)|(sec%10)) & 0x7F);  // clear OS flag
+    Wire.write((((mn /10)<<4)|(mn %10)) & 0x7F);
+    Wire.write((((hr /10)<<4)|(hr %10)) & 0x3F);
+    Wire.write((((day/10)<<4)|(day%10)) & 0x3F);
+    Wire.write(0x00);                               // weekday (don't care)
+    Wire.write((((mo /10)<<4)|(mo %10)) & 0x1F);
+    Wire.write( ((yr /10)<<4)|(yr %10));
+    Wire.endTransmission();
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Rolling pre-jump buffer (300 samples × 32 B = 9.4 KB)
@@ -436,11 +504,6 @@ void stopLog() {
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Serial command interface
-//   PING          → PONG   (readiness check)
-//   LIST          → LIST_START / <name> <bytes> / LIST_END
-//   DUMP          → DUMP_START / FILE_START <name> / …csv… / FILE_END <name> / DUMP_END
-// Commands are ASCII, terminated by \n or \r.  Case-insensitive.
-// DUMP blocks the loop for the duration; sensor + display pause briefly.
 // ═══════════════════════════════════════════════════════════════════════════
 static void cmdList() {
     Serial.println("LIST_START");
@@ -467,7 +530,6 @@ static void cmdDump() {
         size_t n;
         while ((n = f.read(buf, sizeof(buf))) > 0)
             Serial.write(buf, n);
-        // guarantee FILE_END lands on its own line even if file lacked trailing \n
         if (f.size() > 0) {
             f.seek(f.size() - 1);
             if (f.read() != '\n') Serial.write('\n');
@@ -560,27 +622,20 @@ static void stopBuzz() {
     digitalWrite(MOTOR_PIN, LOW);
     motorOffAt = 0;
 }
-
-// Pulse width tracks urgency: min(150 ms, halfMs) — short near alertStartFt,
-// even shorter near alertStopFt so duty cycle stays reasonable.
 static void startBuzz(uint32_t halfMs, uint32_t now) {
     if (!cfg.vibrationEnabled) return;
     uint32_t onMs = (halfMs < 150) ? halfMs : 150;
     digitalWrite(MOTOR_PIN, HIGH);
     motorOffAt = now + onMs;
 }
-
 static void tickBuzz(uint32_t now) {
     if (motorOffAt == 0) return;
-    // overflow-safe: difference wraps to large value when now < motorOffAt
     if (now - motorOffAt < 0x80000000UL) stopBuzz();
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Alert zone flash — non-blocking; never touches cal or log state
 // ═══════════════════════════════════════════════════════════════════════════
-
-// Half-period in ms: 500 ms (slow) near alertStartFt → 100 ms (fast) near alertStopFt
 static uint32_t alertFlashHalfMs(float aglFt) {
     float range = cfg.alertStartFt - cfg.alertStopFt;
     if (range <= 0.0f) return 150;
@@ -604,6 +659,7 @@ static void checkAlert(float aglFt, float vsFps, uint32_t now) {
         flashRed   = false;
         stopBuzz();
         drawStaticUI();
+        updateBLEBadge();
         updateCalBadge();
         updateBatDisplay();
         updateAltDisplay(aglFt);
@@ -613,7 +669,6 @@ static void checkAlert(float aglFt, float vsFps, uint32_t now) {
     }
 }
 
-// Called every loop() iteration — decoupled from 10Hz sample gate
 static void tickAlert(uint32_t now) {
     if (alertState != ALERT_ON) return;
     uint32_t halfMs = alertFlashHalfMs(cachedAltFt);
@@ -621,12 +676,10 @@ static void tickAlert(uint32_t now) {
     lastFlashMs = now;
     flashRed = !flashRed;
     gfx->fillScreen(flashRed ? C_RED : C_BG);
-    // AGL number always drawn on top in white — altitude awareness is the point
     char buf[12];
     if (cal.isValid()) snprintf(buf, sizeof(buf), "%+.0f", cachedAltFt);
     else               snprintf(buf, sizeof(buf), "%.0f",  cachedAltFt);
     centeredText(Y_ALT, 6, C_WHITE, buf);
-    // Motor pulse on every RED frame — synced with flash, width tracks urgency
     if (flashRed) startBuzz(halfMs, now);
 }
 
@@ -659,6 +712,227 @@ static void handleButton() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// BLE GATT server  (NimBLE-Arduino)
+//
+// Service:    A1710000-0000-0000-0000-000000000000
+//
+// Settings (Read + Write):
+//   A1710001  alertStartFt      uint16 LE, feet          default 10  (REAL 3000)
+//   A1710002  alertStopFt       uint16 LE, feet          default  2  (REAL  500)
+//   A1710003  alertsEnabled     uint8  0=off 1=on
+//   A1710004  vibrationEnabled  uint8  0=off 1=on
+//   A1710005  autoLogEnabled    uint8  0=off 1=on
+//   A1710006  units             uint8  0=ft/fps  1=m/m·s⁻¹
+//
+// Live data (Read + Notify, updated at 2 Hz):
+//   A1710011  altitude          int16 LE, signed feet
+//   A1710012  vspeed            int16 LE, fps×10  (divide by 10 for fps)
+//   A1710013  battery           uint8  0–100 %
+//   A1710014  calState          uint8  0=auto 1=manual 2=uncal
+//   A1710015  logState          uint8  0=idle 1=recording
+//   A1710016  logDuration       uint32 LE, seconds since log start
+//   A1710017  rtcDatetime       UTF-8 "YYYY-MM-DD HH:MM:SS"
+//
+// Commands (Write-only — write any value to trigger):
+//   A1710021  calibrate         uint8 — triggers manual ground calibration
+//   A1710022  startLog          uint8 — starts jump log (manual trigger)
+//   A1710023  stopLog           uint8 — stops jump log
+//   A1710024  setRTC            UTF-8 "YYMMDDHHmmss"  e.g. "260529143000"
+// ═══════════════════════════════════════════════════════════════════════════
+
+#define BLE_SVC  "A1710000-0000-0000-0000-000000000000"
+#define BLE_C001 "A1710001-0000-0000-0000-000000000000"
+#define BLE_C002 "A1710002-0000-0000-0000-000000000000"
+#define BLE_C003 "A1710003-0000-0000-0000-000000000000"
+#define BLE_C004 "A1710004-0000-0000-0000-000000000000"
+#define BLE_C005 "A1710005-0000-0000-0000-000000000000"
+#define BLE_C006 "A1710006-0000-0000-0000-000000000000"
+#define BLE_C011 "A1710011-0000-0000-0000-000000000000"
+#define BLE_C012 "A1710012-0000-0000-0000-000000000000"
+#define BLE_C013 "A1710013-0000-0000-0000-000000000000"
+#define BLE_C014 "A1710014-0000-0000-0000-000000000000"
+#define BLE_C015 "A1710015-0000-0000-0000-000000000000"
+#define BLE_C016 "A1710016-0000-0000-0000-000000000000"
+#define BLE_C017 "A1710017-0000-0000-0000-000000000000"
+#define BLE_C021 "A1710021-0000-0000-0000-000000000000"
+#define BLE_C022 "A1710022-0000-0000-0000-000000000000"
+#define BLE_C023 "A1710023-0000-0000-0000-000000000000"
+#define BLE_C024 "A1710024-0000-0000-0000-000000000000"
+
+class AW_ServerCB : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer*)    override { bleConnected = true;  bleStateChanged = true; }
+    void onDisconnect(NimBLEServer*) override {
+        bleConnected = false; bleStateChanged = true;
+        NimBLEDevice::startAdvertising();
+    }
+};
+class CB_AlertStart : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *p) override {
+        if (p->getValue().size() >= 2) {
+            uint16_t v; memcpy(&v, p->getValue().data(), 2);
+            cfg.alertStartFt = (float)v;
+        }
+    }
+};
+class CB_AlertStop : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *p) override {
+        if (p->getValue().size() >= 2) {
+            uint16_t v; memcpy(&v, p->getValue().data(), 2);
+            cfg.alertStopFt = (float)v;
+        }
+    }
+};
+class CB_AlertsEn : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *p) override {
+        if (p->getValue().size() >= 1) cfg.alertsEnabled = p->getValue()[0] != 0;
+    }
+};
+class CB_VibEn : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *p) override {
+        if (p->getValue().size() >= 1) cfg.vibrationEnabled = p->getValue()[0] != 0;
+    }
+};
+class CB_AutoLogEn : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *p) override {
+        if (p->getValue().size() >= 1) cfg.autoLogEnabled = p->getValue()[0] != 0;
+    }
+};
+class CB_Units : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *p) override {
+        if (p->getValue().size() >= 1) cfg.units = p->getValue()[0] & 1;
+    }
+};
+class CB_Calibrate : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic*) override { bleCmd_calibrate = true; }
+};
+class CB_StartLog : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic*) override { bleCmd_startLog = true; }
+};
+class CB_StopLog : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic*) override { bleCmd_stopLog = true; }
+};
+class CB_SetRTC : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic *p) override {
+        auto v = p->getValue();
+        if (v.size() >= 12) {
+            bleRtcYr  = (v[0]-'0')*10 + (v[1]-'0');
+            bleRtcMo  = (v[2]-'0')*10 + (v[3]-'0');
+            bleRtcDay = (v[4]-'0')*10 + (v[5]-'0');
+            bleRtcHr  = (v[6]-'0')*10 + (v[7]-'0');
+            bleRtcMn  = (v[8]-'0')*10 + (v[9]-'0');
+            bleRtcSec = (v[10]-'0')*10 + (v[11]-'0');
+            bleCmd_setRTC = true;
+        }
+    }
+};
+
+static void initBLE() {
+    NimBLEDevice::init("AltiWatch");
+    NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+
+    NimBLEServer  *srv = NimBLEDevice::createServer();
+    srv->setCallbacks(new AW_ServerCB());
+    NimBLEService *svc = srv->createService(BLE_SVC);
+
+    // ── Settings (R/W) ────────────────────────────────────────────────────
+    {
+        auto *c = svc->createCharacteristic(BLE_C001, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+        uint16_t v = (uint16_t)cfg.alertStartFt; c->setValue((uint8_t*)&v, 2);
+        c->setCallbacks(new CB_AlertStart());
+    }
+    {
+        auto *c = svc->createCharacteristic(BLE_C002, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+        uint16_t v = (uint16_t)cfg.alertStopFt; c->setValue((uint8_t*)&v, 2);
+        c->setCallbacks(new CB_AlertStop());
+    }
+    {
+        auto *c = svc->createCharacteristic(BLE_C003, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+        uint8_t v = cfg.alertsEnabled ? 1 : 0; c->setValue(&v, 1);
+        c->setCallbacks(new CB_AlertsEn());
+    }
+    {
+        auto *c = svc->createCharacteristic(BLE_C004, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+        uint8_t v = cfg.vibrationEnabled ? 1 : 0; c->setValue(&v, 1);
+        c->setCallbacks(new CB_VibEn());
+    }
+    {
+        auto *c = svc->createCharacteristic(BLE_C005, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+        uint8_t v = cfg.autoLogEnabled ? 1 : 0; c->setValue(&v, 1);
+        c->setCallbacks(new CB_AutoLogEn());
+    }
+    {
+        auto *c = svc->createCharacteristic(BLE_C006, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
+        uint8_t v = cfg.units; c->setValue(&v, 1);
+        c->setCallbacks(new CB_Units());
+    }
+
+    // ── Live data (Read + Notify) ─────────────────────────────────────────
+    pAltChar      = svc->createCharacteristic(BLE_C011, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    pVsChar       = svc->createCharacteristic(BLE_C012, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    pBatChar      = svc->createCharacteristic(BLE_C013, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    pCalChar      = svc->createCharacteristic(BLE_C014, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    pLogStateChar = svc->createCharacteristic(BLE_C015, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    pLogDurChar   = svc->createCharacteristic(BLE_C016, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+    pRtcChar      = svc->createCharacteristic(BLE_C017, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+
+    // ── Commands (Write-only) ─────────────────────────────────────────────
+    svc->createCharacteristic(BLE_C021, NIMBLE_PROPERTY::WRITE)->setCallbacks(new CB_Calibrate());
+    svc->createCharacteristic(BLE_C022, NIMBLE_PROPERTY::WRITE)->setCallbacks(new CB_StartLog());
+    svc->createCharacteristic(BLE_C023, NIMBLE_PROPERTY::WRITE)->setCallbacks(new CB_StopLog());
+    svc->createCharacteristic(BLE_C024, NIMBLE_PROPERTY::WRITE)->setCallbacks(new CB_SetRTC());
+
+    svc->start();
+
+    NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
+    adv->addServiceUUID(svc->getUUID());
+    adv->setScanResponse(true);
+    adv->start();
+
+    Serial.println("BLE advertising as 'AltiWatch'");
+}
+
+static void updateBLENotify(float aglFt, float vsFps) {
+    if (!bleConnected) return;
+
+    int16_t altVal = (int16_t)aglFt;
+    pAltChar->setValue((uint8_t*)&altVal, 2);
+    pAltChar->notify();
+
+    int16_t vsVal = (int16_t)(vsFps * 10.0f);
+    pVsChar->setValue((uint8_t*)&vsVal, 2);
+    pVsChar->notify();
+
+    int     batMv = analogReadMilliVolts(cfg.batAdcPin) * 2;
+    uint8_t pct   = (uint8_t)constrain((int)(100.0f * (batMv - cfg.batMvEmpty) /
+                                       (float)(cfg.batMvFull - cfg.batMvEmpty)), 0, 100);
+    pBatChar->setValue(&pct, 1);
+    pBatChar->notify();
+
+    uint8_t calVal = (cal.source == CAL_AUTO) ? 0 : (cal.source == CAL_MANUAL) ? 1 : 2;
+    pCalChar->setValue(&calVal, 1);
+    pCalChar->notify();
+
+    uint8_t logVal = logActive ? 1 : 0;
+    pLogStateChar->setValue(&logVal, 1);
+    pLogStateChar->notify();
+
+    uint32_t durSec = logActive ? (millis() - logStartMs) / 1000 : 0;
+    pLogDurChar->setValue((uint8_t*)&durSec, 4);
+    pLogDurChar->notify();
+
+    char rtcStr[20] = "RTC NOT SET";
+    if (rtcIsValid()) {
+        uint8_t regs[7];
+        if (iicReadBuf(cfg.rtcAddr, 0x04, regs, 7))
+            snprintf(rtcStr, sizeof(rtcStr), "20%02d-%02d-%02d %02d:%02d:%02d",
+                     bcdDec(regs[6]), bcdDec(regs[5] & 0x1F), bcdDec(regs[3] & 0x3F),
+                     bcdDec(regs[2] & 0x3F), bcdDec(regs[1] & 0x7F), bcdDec(regs[0] & 0x7F));
+    }
+    pRtcChar->setValue((uint8_t*)rtcStr, strlen(rtcStr));
+    pRtcChar->notify();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // setup
 // ═══════════════════════════════════════════════════════════════════════════
 void setup() {
@@ -670,6 +944,7 @@ void setup() {
     pinMode(LCD_BL, OUTPUT); digitalWrite(LCD_BL, HIGH);
     gfx->begin();
     drawStaticUI();
+    updateBLEBadge();
     updateCalBadge();
     updateBatDisplay();
     updateStatusLine();
@@ -702,7 +977,9 @@ void setup() {
                       LittleFS.usedBytes(), LittleFS.totalBytes());
     }
 
-    Serial.println("AltiWatch stage 6 — collecting boot samples...");
+    initBLE();
+
+    Serial.println("AltiWatch stage 9 — collecting boot samples...");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -768,8 +1045,22 @@ void loop() {
     rollPush(s);
     if (logActive) writeSampleToLog(s);
 
-    checkAutoTriggers(vsFps, dispAltFt, now);
+    if (cfg.autoLogEnabled) checkAutoTriggers(vsFps, dispAltFt, now);
     checkAlert(dispAltFt, vsFps, now);
+
+    // ── BLE command dispatch (deferred from BLE-task callbacks) ───────────
+    if (bleCmd_calibrate) {
+        bleCmd_calibrate = false;
+        doManualCalibration(); updateCalBadge(); updateStatusLine();
+    }
+    if (bleCmd_startLog)  { bleCmd_startLog  = false; startLog(TRIG_MANUAL); }
+    if (bleCmd_stopLog)   { bleCmd_stopLog   = false; stopLog(); }
+    if (bleCmd_setRTC) {
+        bleCmd_setRTC = false;
+        rtcSetTime(bleRtcYr, bleRtcMo, bleRtcDay, bleRtcHr, bleRtcMn, bleRtcSec);
+        Serial.printf("RTC set: 20%02d-%02d-%02d %02d:%02d:%02d\n",
+                      bleRtcYr, bleRtcMo, bleRtcDay, bleRtcHr, bleRtcMn, bleRtcSec);
+    }
 
     // ── Serial ────────────────────────────────────────────────────────────
     Serial.printf("%s %+.0fft  %+.1ffps  %.2fhPa  %.1fC  [%.2f,%.2f,%.2f]g%s\n",
@@ -779,12 +1070,14 @@ void loop() {
                   imuAx, imuAy, imuAz,
                   logActive ? "  REC" : "");
 
-    // ── 2 Hz display refresh (suppressed during alert — tickAlert owns screen)
+    // ── 2 Hz display + BLE notify (suppressed during alert) ───────────────
     if (alertState == ALERT_OFF && now - lastDisplayMs >= 500) {
         lastDisplayMs = now;
         updateAltDisplay(dispAltFt);
         updateVsDisplay(vsFps);
         updateBatDisplay();
         updateStatusLine();
+        if (bleStateChanged) { bleStateChanged = false; updateBLEBadge(); }
+        updateBLENotify(dispAltFt, vsFps);
     }
 }
