@@ -1114,6 +1114,7 @@ static void updateBLENotify(float aglFt, float vsFps) {
 // ═══════════════════════════════════════════════════════════════════════════
 void setup() {
     Serial.begin(115200);
+    Serial.setTxTimeoutMs(10);  // don't stall main loop if host disconnects mid-write
     uint32_t t = millis();
     while (!Serial && (millis() - t) < 3000) {}
 
