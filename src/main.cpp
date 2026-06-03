@@ -4,7 +4,6 @@
 #include <Adafruit_BMP3XX.h>
 #include <LittleFS.h>
 #include <NimBLEDevice.h>
-#include <Preferences.h>
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Settings — single source of truth. BLE-ready: serialise this struct.
@@ -773,32 +772,58 @@ static void handleButton() {
 #define BLE_C024 "A1710024-0000-0000-0000-000000000000"
 #define BLE_C025 "A1710025-0000-0000-0000-000000000000"
 
-// ── NVS load / save — always called from the main task, never from BLE task ──
+// ── Settings persistence via LittleFS ("/settings.bin") ──────────────────────
+// Always called from the main task. LittleFS is proven working (jump logs).
+#define SETTINGS_FILE  "/settings.bin"
+#define SETTINGS_MAGIC 0xA1
+
+struct __attribute__((packed)) SettingsBlob {
+    uint8_t  magic;
+    uint16_t alertStartFt;
+    uint16_t alertStopFt;
+    uint8_t  alertsEnabled;
+    uint8_t  vibrationEnabled;
+    uint8_t  autoLogEnabled;
+    uint8_t  units;
+};  // 9 bytes
+
 static void loadSettings() {
-    Preferences p;
-    p.begin("altiwatch", true);  // read-only
-    if (p.isKey("alertStart")) cfg.alertStartFt     = (float)p.getUShort("alertStart");
-    if (p.isKey("alertStop"))  cfg.alertStopFt      = (float)p.getUShort("alertStop");
-    if (p.isKey("alertsEn"))   cfg.alertsEnabled    = p.getUChar("alertsEn")  != 0;
-    if (p.isKey("vibEn"))      cfg.vibrationEnabled = p.getUChar("vibEn")     != 0;
-    if (p.isKey("autoLogEn"))  cfg.autoLogEnabled   = p.getUChar("autoLogEn") != 0;
-    if (p.isKey("units"))      cfg.units            = p.getUChar("units");
-    p.end();
-    Serial.printf("[NVS load] alertStart=%.0f alertStop=%.0f alertsEn=%d vibEn=%d autoLogEn=%d units=%d\n",
-                  cfg.alertStartFt, cfg.alertStopFt,
-                  cfg.alertsEnabled, cfg.vibrationEnabled, cfg.autoLogEnabled, cfg.units);
+    File f = LittleFS.open(SETTINGS_FILE, "r");
+    if (!f) {
+        Serial.println("[Settings] No saved settings — using firmware defaults");
+        return;
+    }
+    SettingsBlob b;
+    bool ok = (f.read((uint8_t*)&b, sizeof(b)) == sizeof(b)) && (b.magic == SETTINGS_MAGIC);
+    f.close();
+    if (ok) {
+        cfg.alertStartFt     = (float)b.alertStartFt;
+        cfg.alertStopFt      = (float)b.alertStopFt;
+        cfg.alertsEnabled    = b.alertsEnabled    != 0;
+        cfg.vibrationEnabled = b.vibrationEnabled != 0;
+        cfg.autoLogEnabled   = b.autoLogEnabled   != 0;
+        cfg.units            = b.units;
+        Serial.printf("[Settings] Loaded: alertStart=%.0f alertStop=%.0f alertsEn=%d vibEn=%d autoLogEn=%d units=%d\n",
+                      cfg.alertStartFt, cfg.alertStopFt,
+                      cfg.alertsEnabled, cfg.vibrationEnabled, cfg.autoLogEnabled, cfg.units);
+    } else {
+        Serial.println("[Settings] Bad magic — ignoring file, using firmware defaults");
+    }
 }
 static void saveSettings() {
-    Preferences p;
-    p.begin("altiwatch", false);  // read-write
-    p.putUShort("alertStart", (uint16_t)cfg.alertStartFt);
-    p.putUShort("alertStop",  (uint16_t)cfg.alertStopFt);
-    p.putUChar("alertsEn",    cfg.alertsEnabled    ? 1 : 0);
-    p.putUChar("vibEn",       cfg.vibrationEnabled ? 1 : 0);
-    p.putUChar("autoLogEn",   cfg.autoLogEnabled   ? 1 : 0);
-    p.putUChar("units",       cfg.units);
-    p.end();
-    Serial.printf("[NVS save] alertStart=%.0f alertStop=%.0f alertsEn=%d vibEn=%d autoLogEn=%d units=%d\n",
+    File f = LittleFS.open(SETTINGS_FILE, "w");
+    if (!f) { Serial.println("[Settings] ERROR: cannot write settings file"); return; }
+    SettingsBlob b;
+    b.magic           = SETTINGS_MAGIC;
+    b.alertStartFt    = (uint16_t)cfg.alertStartFt;
+    b.alertStopFt     = (uint16_t)cfg.alertStopFt;
+    b.alertsEnabled   = cfg.alertsEnabled    ? 1 : 0;
+    b.vibrationEnabled = cfg.vibrationEnabled ? 1 : 0;
+    b.autoLogEnabled  = cfg.autoLogEnabled   ? 1 : 0;
+    b.units           = cfg.units;
+    f.write((uint8_t*)&b, sizeof(b));
+    f.close();
+    Serial.printf("[Settings] Saved: alertStart=%.0f alertStop=%.0f alertsEn=%d vibEn=%d autoLogEn=%d units=%d\n",
                   cfg.alertStartFt, cfg.alertStopFt,
                   cfg.alertsEnabled, cfg.vibrationEnabled, cfg.autoLogEnabled, cfg.units);
 }
@@ -1140,8 +1165,8 @@ void loop() {
     }
     if (bleCmd_factoryReset) {
         bleCmd_factoryReset = false;
-        settingsDirty = false;  // don't save defaults back over the cleared NVS
-        Preferences p; p.begin("altiwatch", false); p.clear(); p.end();
+        settingsDirty = false;  // don't save defaults over the just-deleted file
+        LittleFS.remove(SETTINGS_FILE);
         Settings defaults;
         cfg.alertStartFt     = defaults.alertStartFt;
         cfg.alertStopFt      = defaults.alertStopFt;
