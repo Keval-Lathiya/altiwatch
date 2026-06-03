@@ -616,15 +616,21 @@ static void handleSerialCmd(const char *cmd) {
 }
 
 static void handleSerialInput() {
-    static char buf[8];
-    static uint8_t len = 0;
+    static char     buf[8];
+    static uint8_t  len        = 0;
+    static uint32_t lastCharMs = 0;
     while (Serial.available()) {
         char c = (char)Serial.read();
+        lastCharMs = millis();
         if (c == '\n' || c == '\r') {
             if (len > 0) { buf[len] = '\0'; handleSerialCmd(buf); len = 0; }
         } else if (len < sizeof(buf) - 1) {
             buf[len++] = (char)toupper((unsigned char)c);
         }
+    }
+    // Dispatch after 50 ms silence — handles monitors that send no line terminator
+    if (len > 0 && millis() - lastCharMs > 50) {
+        buf[len] = '\0'; handleSerialCmd(buf); len = 0;
     }
 }
 
