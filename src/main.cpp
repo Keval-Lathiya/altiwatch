@@ -4,6 +4,7 @@
 #include <Adafruit_BMP3XX.h>
 #include <LittleFS.h>
 #include <NimBLEDevice.h>
+#include <Preferences.h>
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Settings — single source of truth. BLE-ready: serialise this struct.
@@ -176,7 +177,8 @@ static volatile bool bleStateChanged = false;
 static volatile bool bleCmd_calibrate = false;
 static volatile bool bleCmd_startLog  = false;
 static volatile bool bleCmd_stopLog   = false;
-static volatile bool bleCmd_setRTC    = false;
+static volatile bool bleCmd_setRTC       = false;
+static volatile bool bleCmd_factoryReset = false;
 static uint8_t bleRtcYr = 0, bleRtcMo = 1, bleRtcDay = 1;
 static uint8_t bleRtcHr = 0, bleRtcMn = 0, bleRtcSec = 0;
 
@@ -645,6 +647,15 @@ static uint32_t alertFlashHalfMs(float aglFt) {
 
 static void checkAlert(float aglFt, float vsFps, uint32_t now) {
     if (!cfg.alertsEnabled || !cal.isValid()) return;
+
+    // Print whenever live thresholds change — confirms BLE writes took effect
+    static float dbgStart = -1, dbgStop = -1;
+    if (cfg.alertStartFt != dbgStart || cfg.alertStopFt != dbgStop) {
+        dbgStart = cfg.alertStartFt; dbgStop = cfg.alertStopFt;
+        Serial.printf("[checkAlert] thresholds: start=%.0fft stop=%.0fft\n",
+                      cfg.alertStartFt, cfg.alertStopFt);
+    }
+
     bool inZone = (vsFps < 0.0f)
                && (aglFt < cfg.alertStartFt)
                && (aglFt > cfg.alertStopFt);
@@ -652,8 +663,8 @@ static void checkAlert(float aglFt, float vsFps, uint32_t now) {
         alertState  = ALERT_ON;
         flashRed    = true;
         lastFlashMs = now;
-        Serial.printf("ALERT ON:  %.0fft  flash-half=%ums\n",
-                      aglFt, (unsigned)alertFlashHalfMs(aglFt));
+        Serial.printf("ALERT ON:  %.0fft  [start=%.0f stop=%.0f]  flash-half=%ums\n",
+                      aglFt, cfg.alertStartFt, cfg.alertStopFt, (unsigned)alertFlashHalfMs(aglFt));
     } else if (!inZone && alertState == ALERT_ON) {
         alertState = ALERT_OFF;
         flashRed   = false;
@@ -738,6 +749,7 @@ static void handleButton() {
 //   A1710022  startLog          uint8 — starts jump log (manual trigger)
 //   A1710023  stopLog           uint8 — stops jump log
 //   A1710024  setRTC            UTF-8 "YYMMDDHHmmss"  e.g. "260529143000"
+//   A1710025  factoryReset      uint8 — clears NVS, reverts all settings to defaults
 // ═══════════════════════════════════════════════════════════════════════════
 
 #define BLE_SVC  "A1710000-0000-0000-0000-000000000000"
@@ -758,6 +770,29 @@ static void handleButton() {
 #define BLE_C022 "A1710022-0000-0000-0000-000000000000"
 #define BLE_C023 "A1710023-0000-0000-0000-000000000000"
 #define BLE_C024 "A1710024-0000-0000-0000-000000000000"
+#define BLE_C025 "A1710025-0000-0000-0000-000000000000"
+
+// ── NVS helpers (namespace "altiwatch") ──────────────────────────────────────
+static void nvsSaveU16(const char *key, uint16_t v) {
+    Preferences p; p.begin("altiwatch", false); p.putUShort(key, v); p.end();
+}
+static void nvsSaveU8(const char *key, uint8_t v) {
+    Preferences p; p.begin("altiwatch", false); p.putUChar(key, v); p.end();
+}
+static void loadSettings() {
+    Preferences p;
+    p.begin("altiwatch", true);  // read-only
+    if (p.isKey("alertStart")) cfg.alertStartFt    = (float)p.getUShort("alertStart");
+    if (p.isKey("alertStop"))  cfg.alertStopFt     = (float)p.getUShort("alertStop");
+    if (p.isKey("alertsEn"))   cfg.alertsEnabled   = p.getUChar("alertsEn")  != 0;
+    if (p.isKey("vibEn"))      cfg.vibrationEnabled = p.getUChar("vibEn")    != 0;
+    if (p.isKey("autoLogEn"))  cfg.autoLogEnabled  = p.getUChar("autoLogEn") != 0;
+    if (p.isKey("units"))      cfg.units           = p.getUChar("units");
+    p.end();
+    Serial.printf("[NVS] alertStart=%.0f alertStop=%.0f alertsEn=%d vibEn=%d autoLogEn=%d units=%d\n",
+                  cfg.alertStartFt, cfg.alertStopFt,
+                  cfg.alertsEnabled, cfg.vibrationEnabled, cfg.autoLogEnabled, cfg.units);
+}
 
 class AW_ServerCB : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer*)    override { bleConnected = true;  bleStateChanged = true; }
@@ -770,7 +805,10 @@ class CB_AlertStart : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *p) override {
         if (p->getValue().size() >= 2) {
             uint16_t v; memcpy(&v, p->getValue().data(), 2);
+            float old = cfg.alertStartFt;
             cfg.alertStartFt = (float)v;
+            nvsSaveU16("alertStart", v);
+            Serial.printf("[BLE] alertStartFt: %.0f -> %.0f (saved)\n", old, cfg.alertStartFt);
         }
     }
 };
@@ -778,28 +816,51 @@ class CB_AlertStop : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *p) override {
         if (p->getValue().size() >= 2) {
             uint16_t v; memcpy(&v, p->getValue().data(), 2);
+            float old = cfg.alertStopFt;
             cfg.alertStopFt = (float)v;
+            nvsSaveU16("alertStop", v);
+            Serial.printf("[BLE] alertStopFt: %.0f -> %.0f (saved)\n", old, cfg.alertStopFt);
         }
     }
 };
 class CB_AlertsEn : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *p) override {
-        if (p->getValue().size() >= 1) cfg.alertsEnabled = p->getValue()[0] != 0;
+        if (p->getValue().size() >= 1) {
+            bool old = cfg.alertsEnabled;
+            cfg.alertsEnabled = p->getValue()[0] != 0;
+            nvsSaveU8("alertsEn", cfg.alertsEnabled ? 1 : 0);
+            Serial.printf("[BLE] alertsEnabled: %d -> %d (saved)\n", old, cfg.alertsEnabled);
+        }
     }
 };
 class CB_VibEn : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *p) override {
-        if (p->getValue().size() >= 1) cfg.vibrationEnabled = p->getValue()[0] != 0;
+        if (p->getValue().size() >= 1) {
+            bool old = cfg.vibrationEnabled;
+            cfg.vibrationEnabled = p->getValue()[0] != 0;
+            nvsSaveU8("vibEn", cfg.vibrationEnabled ? 1 : 0);
+            Serial.printf("[BLE] vibrationEnabled: %d -> %d (saved)\n", old, cfg.vibrationEnabled);
+        }
     }
 };
 class CB_AutoLogEn : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *p) override {
-        if (p->getValue().size() >= 1) cfg.autoLogEnabled = p->getValue()[0] != 0;
+        if (p->getValue().size() >= 1) {
+            bool old = cfg.autoLogEnabled;
+            cfg.autoLogEnabled = p->getValue()[0] != 0;
+            nvsSaveU8("autoLogEn", cfg.autoLogEnabled ? 1 : 0);
+            Serial.printf("[BLE] autoLogEnabled: %d -> %d (saved)\n", old, cfg.autoLogEnabled);
+        }
     }
 };
 class CB_Units : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *p) override {
-        if (p->getValue().size() >= 1) cfg.units = p->getValue()[0] & 1;
+        if (p->getValue().size() >= 1) {
+            uint8_t old = cfg.units;
+            cfg.units = p->getValue()[0] & 1;
+            nvsSaveU8("units", cfg.units);
+            Serial.printf("[BLE] units: %d -> %d (saved)\n", old, cfg.units);
+        }
     }
 };
 class CB_Calibrate : public NimBLECharacteristicCallbacks {
@@ -810,6 +871,9 @@ class CB_StartLog : public NimBLECharacteristicCallbacks {
 };
 class CB_StopLog : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic*) override { bleCmd_stopLog = true; }
+};
+class CB_FactoryReset : public NimBLECharacteristicCallbacks {
+    void onWrite(NimBLECharacteristic*) override { bleCmd_factoryReset = true; }
 };
 class CB_SetRTC : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *p) override {
@@ -880,6 +944,7 @@ static void initBLE() {
     svc->createCharacteristic(BLE_C022, NIMBLE_PROPERTY::WRITE)->setCallbacks(new CB_StartLog());
     svc->createCharacteristic(BLE_C023, NIMBLE_PROPERTY::WRITE)->setCallbacks(new CB_StopLog());
     svc->createCharacteristic(BLE_C024, NIMBLE_PROPERTY::WRITE)->setCallbacks(new CB_SetRTC());
+    svc->createCharacteristic(BLE_C025, NIMBLE_PROPERTY::WRITE)->setCallbacks(new CB_FactoryReset());
 
     svc->start();
 
@@ -977,6 +1042,7 @@ void setup() {
                       LittleFS.usedBytes(), LittleFS.totalBytes());
     }
 
+    loadSettings();  // restore BLE-written settings from NVS (falls back to defaults)
     initBLE();
 
     Serial.println("AltiWatch stage 9 — collecting boot samples...");
@@ -1060,6 +1126,18 @@ void loop() {
         rtcSetTime(bleRtcYr, bleRtcMo, bleRtcDay, bleRtcHr, bleRtcMn, bleRtcSec);
         Serial.printf("RTC set: 20%02d-%02d-%02d %02d:%02d:%02d\n",
                       bleRtcYr, bleRtcMo, bleRtcDay, bleRtcHr, bleRtcMn, bleRtcSec);
+    }
+    if (bleCmd_factoryReset) {
+        bleCmd_factoryReset = false;
+        Preferences p; p.begin("altiwatch", false); p.clear(); p.end();
+        Settings defaults;
+        cfg.alertStartFt    = defaults.alertStartFt;
+        cfg.alertStopFt     = defaults.alertStopFt;
+        cfg.alertsEnabled   = defaults.alertsEnabled;
+        cfg.vibrationEnabled = defaults.vibrationEnabled;
+        cfg.autoLogEnabled  = defaults.autoLogEnabled;
+        cfg.units           = defaults.units;
+        Serial.println("[BLE] Factory reset: NVS cleared, firmware defaults restored");
     }
 
     // ── Serial ────────────────────────────────────────────────────────────
