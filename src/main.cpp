@@ -153,6 +153,7 @@ static bool     longFired     = false;
 static uint32_t lastSampleMs  = 0;
 static uint32_t lastDisplayMs = 0;
 static uint32_t lastBootMs    = 0;
+static uint32_t lastSaveMs    = 0;   // set by saveSettings(), drives "CFG SAVED" flash
 
 static uint32_t autoStartSustainMs = 0;
 static uint32_t autoStopSustainMs  = 0;
@@ -324,6 +325,10 @@ void updateVsDisplay(float vsFps) {
     }
 }
 void updateStatusLine() {
+    if (lastSaveMs != 0 && millis() - lastSaveMs < 2000) {
+        updateCentered(Y_STATUS, 18, 2, C_GREEN, "CFG SAVED");
+        return;
+    }
     if (logActive) {
         uint32_t elapsed = (millis() - logStartMs) / 1000;
         char buf[24];
@@ -823,6 +828,7 @@ static void saveSettings() {
     b.units           = cfg.units;
     f.write((uint8_t*)&b, sizeof(b));
     f.close();
+    lastSaveMs = millis();
     Serial.printf("[Settings] Saved: alertStart=%.0f alertStop=%.0f alertsEn=%d vibEn=%d autoLogEn=%d units=%d\n",
                   cfg.alertStartFt, cfg.alertStopFt,
                   cfg.alertsEnabled, cfg.vibrationEnabled, cfg.autoLogEnabled, cfg.units);
@@ -837,25 +843,37 @@ class AW_ServerCB : public NimBLEServerCallbacks {
 };
 // BLE callbacks: update cfg + print, then set dirty flag.
 // NVS write happens in main loop via saveSettings() — never from BLE task.
+// alertStartFt / alertStopFt use plain decimal strings ("3000", "500").
+// User types a number in LightBlue text mode — no byte-order confusion.
 class CB_AlertStart : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *p) override {
-        if (p->getValue().size() >= 2) {
-            uint16_t v; memcpy(&v, p->getValue().data(), 2);
-            float old = cfg.alertStartFt;
-            cfg.alertStartFt = (float)v;
-            settingsDirty = true;
-            Serial.printf("[BLE] alertStartFt: %.0f -> %.0f\n", old, cfg.alertStartFt);
+        auto v = p->getValue();
+        if (v.size() > 0) {
+            char buf[12] = {0};
+            memcpy(buf, v.data(), v.size() < 11 ? v.size() : 11);
+            float newVal = atof(buf);
+            if (newVal > 0.0f) {
+                float old = cfg.alertStartFt;
+                cfg.alertStartFt = newVal;
+                settingsDirty = true;
+                Serial.printf("[BLE] alertStartFt: %.0f -> %.0f\n", old, cfg.alertStartFt);
+            }
         }
     }
 };
 class CB_AlertStop : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic *p) override {
-        if (p->getValue().size() >= 2) {
-            uint16_t v; memcpy(&v, p->getValue().data(), 2);
-            float old = cfg.alertStopFt;
-            cfg.alertStopFt = (float)v;
-            settingsDirty = true;
-            Serial.printf("[BLE] alertStopFt: %.0f -> %.0f\n", old, cfg.alertStopFt);
+        auto v = p->getValue();
+        if (v.size() > 0) {
+            char buf[12] = {0};
+            memcpy(buf, v.data(), v.size() < 11 ? v.size() : 11);
+            float newVal = atof(buf);
+            if (newVal >= 0.0f) {
+                float old = cfg.alertStopFt;
+                cfg.alertStopFt = newVal;
+                settingsDirty = true;
+                Serial.printf("[BLE] alertStopFt: %.0f -> %.0f\n", old, cfg.alertStopFt);
+            }
         }
     }
 };
@@ -937,12 +955,14 @@ static void initBLE() {
     // ── Settings (R/W) ────────────────────────────────────────────────────
     {
         auto *c = svc->createCharacteristic(BLE_C001, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-        uint16_t v = (uint16_t)cfg.alertStartFt; c->setValue((uint8_t*)&v, 2);
+        char sb[8]; snprintf(sb, sizeof(sb), "%.0f", cfg.alertStartFt);
+        c->setValue(sb);
         c->setCallbacks(new CB_AlertStart());
     }
     {
         auto *c = svc->createCharacteristic(BLE_C002, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE);
-        uint16_t v = (uint16_t)cfg.alertStopFt; c->setValue((uint8_t*)&v, 2);
+        char sb[8]; snprintf(sb, sizeof(sb), "%.0f", cfg.alertStopFt);
+        c->setValue(sb);
         c->setCallbacks(new CB_AlertStop());
     }
     {
