@@ -398,6 +398,11 @@ void handleBootSample(float altM) {
         bootPhase = BOOT_RUNNING;
         doAutoCalibration();
         updateCalBadge();
+        // Show loaded alert thresholds for 2s so persistence can be confirmed visually
+        char ab[28];
+        snprintf(ab, sizeof(ab), "ALERT %.0f / %.0f ft", cfg.alertStartFt, cfg.alertStopFt);
+        updateCentered(Y_STATUS, 18, 1, C_CYAN, ab);
+        delay(2000);
         updateStatusLine();
     }
 }
