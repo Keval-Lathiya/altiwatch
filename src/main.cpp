@@ -514,18 +514,13 @@ void stopLog() {
     updateStatusLine();
 }
 
-// ── Settings file constants (used by serial STATUS cmd and BLE persistence) ──
+// ── Settings file constants (9-byte layout: magic + 2×uint16 LE + 4×uint8) ──
 #define SETTINGS_FILE  "/settings.bin"
 #define SETTINGS_MAGIC 0xA1
-struct __attribute__((packed)) SettingsBlob {
-    uint8_t  magic;
-    uint16_t alertStartFt;
-    uint16_t alertStopFt;
-    uint8_t  alertsEnabled;
-    uint8_t  vibrationEnabled;
-    uint8_t  autoLogEnabled;
-    uint8_t  units;
-};  // 9 bytes
+// byte 0: magic (0xA1)
+// byte 1-2: alertStartFt uint16 LE
+// byte 3-4: alertStopFt  uint16 LE
+// byte 5: alertsEnabled, 6: vibrationEnabled, 7: autoLogEnabled, 8: units
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Serial command interface
@@ -849,16 +844,17 @@ static void loadSettings() {
         Serial.println("[Settings] No saved settings — using firmware defaults");
         return;
     }
-    SettingsBlob b;
-    bool ok = (f.read((uint8_t*)&b, sizeof(b)) == sizeof(b)) && (b.magic == SETTINGS_MAGIC);
+    // Plain byte array — avoids packed-struct unaligned access on Xtensa
+    uint8_t raw[9] = {0};
+    bool ok = (f.read(raw, sizeof(raw)) == sizeof(raw)) && (raw[0] == SETTINGS_MAGIC);
     f.close();
     if (ok) {
-        cfg.alertStartFt     = (float)b.alertStartFt;
-        cfg.alertStopFt      = (float)b.alertStopFt;
-        cfg.alertsEnabled    = b.alertsEnabled    != 0;
-        cfg.vibrationEnabled = b.vibrationEnabled != 0;
-        cfg.autoLogEnabled   = b.autoLogEnabled   != 0;
-        cfg.units            = b.units;
+        cfg.alertStartFt     = (float)((uint16_t)raw[1] | ((uint16_t)raw[2] << 8));
+        cfg.alertStopFt      = (float)((uint16_t)raw[3] | ((uint16_t)raw[4] << 8));
+        cfg.alertsEnabled    = raw[5] != 0;
+        cfg.vibrationEnabled = raw[6] != 0;
+        cfg.autoLogEnabled   = raw[7] != 0;
+        cfg.units            = raw[8];
         Serial.printf("[Settings] Loaded: alertStart=%.0f alertStop=%.0f alertsEn=%d vibEn=%d autoLogEn=%d units=%d\n",
                       cfg.alertStartFt, cfg.alertStopFt,
                       cfg.alertsEnabled, cfg.vibrationEnabled, cfg.autoLogEnabled, cfg.units);
@@ -869,15 +865,18 @@ static void loadSettings() {
 static void saveSettings() {
     File f = LittleFS.open(SETTINGS_FILE, "w");
     if (!f) { Serial.println("[Settings] ERROR: cannot write settings file"); return; }
-    SettingsBlob b;
-    b.magic           = SETTINGS_MAGIC;
-    b.alertStartFt    = (uint16_t)cfg.alertStartFt;
-    b.alertStopFt     = (uint16_t)cfg.alertStopFt;
-    b.alertsEnabled   = cfg.alertsEnabled    ? 1 : 0;
-    b.vibrationEnabled = cfg.vibrationEnabled ? 1 : 0;
-    b.autoLogEnabled  = cfg.autoLogEnabled   ? 1 : 0;
-    b.units           = cfg.units;
-    f.write((uint8_t*)&b, sizeof(b));
+    uint16_t aStart = (uint16_t)cfg.alertStartFt;
+    uint16_t aStop  = (uint16_t)cfg.alertStopFt;
+    uint8_t raw[9] = {
+        SETTINGS_MAGIC,
+        (uint8_t)(aStart & 0xFF), (uint8_t)(aStart >> 8),
+        (uint8_t)(aStop  & 0xFF), (uint8_t)(aStop  >> 8),
+        (uint8_t)(cfg.alertsEnabled    ? 1 : 0),
+        (uint8_t)(cfg.vibrationEnabled ? 1 : 0),
+        (uint8_t)(cfg.autoLogEnabled   ? 1 : 0),
+        cfg.units,
+    };
+    f.write(raw, sizeof(raw));
     f.close();
     lastSaveMs = millis();
     Serial.printf("[Settings] Saved: alertStart=%.0f alertStop=%.0f alertsEn=%d vibEn=%d autoLogEn=%d units=%d\n",
