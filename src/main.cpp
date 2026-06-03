@@ -514,6 +514,19 @@ void stopLog() {
     updateStatusLine();
 }
 
+// ── Settings file constants (used by serial STATUS cmd and BLE persistence) ──
+#define SETTINGS_FILE  "/settings.bin"
+#define SETTINGS_MAGIC 0xA1
+struct __attribute__((packed)) SettingsBlob {
+    uint8_t  magic;
+    uint16_t alertStartFt;
+    uint16_t alertStopFt;
+    uint8_t  alertsEnabled;
+    uint8_t  vibrationEnabled;
+    uint8_t  autoLogEnabled;
+    uint8_t  units;
+};  // 9 bytes
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Serial command interface
 // ═══════════════════════════════════════════════════════════════════════════
@@ -554,10 +567,58 @@ static void cmdDump() {
     Serial.println("DUMP_END");
 }
 
+static void cmdStatus() {
+    Serial.println(F("===== STATUS ====="));
+
+    Serial.println(F("-- Live cfg --"));
+    Serial.printf("  alertStartFt:     %.0f\n",  cfg.alertStartFt);
+    Serial.printf("  alertStopFt:      %.0f\n",  cfg.alertStopFt);
+    Serial.printf("  alertsEnabled:    %d\n",    (int)cfg.alertsEnabled);
+    Serial.printf("  vibrationEnabled: %d\n",    (int)cfg.vibrationEnabled);
+    Serial.printf("  autoLogEnabled:   %d\n",    (int)cfg.autoLogEnabled);
+    Serial.printf("  units:            %d (%s)\n", cfg.units, cfg.units ? "m/ms" : "ft/fps");
+
+    Serial.println(F("-- Calibration --"));
+    Serial.printf("  source:     %s\n", cal.source == CAL_AUTO   ? "AUTO"   :
+                                        cal.source == CAL_MANUAL ? "MANUAL" : "NONE");
+    Serial.printf("  groundAltM: %.2f\n", cal.groundAltM);
+
+    Serial.println(F("-- /settings.bin --"));
+    File f = LittleFS.open(SETTINGS_FILE, "r");
+    if (!f) {
+        Serial.println(F("  (file not found — no BLE write has been saved yet)"));
+    } else {
+        uint8_t raw[16];
+        size_t  n = f.read(raw, sizeof(raw));
+        f.close();
+        Serial.printf("  size: %u bytes\n", (unsigned)n);
+        Serial.print(F("  raw:  "));
+        for (size_t i = 0; i < n; i++) Serial.printf("%02X ", raw[i]);
+        Serial.println();
+        if (n >= sizeof(SettingsBlob)) {
+            SettingsBlob b;
+            memcpy(&b, raw, sizeof(b));
+            Serial.printf("  magic:      0x%02X (%s)\n", b.magic,
+                          b.magic == SETTINGS_MAGIC ? "ok" : "BAD — file ignored on load");
+            Serial.printf("  alertStart: %u\n",  (unsigned)b.alertStartFt);
+            Serial.printf("  alertStop:  %u\n",  (unsigned)b.alertStopFt);
+            Serial.printf("  alertsEn:   %u\n",  (unsigned)b.alertsEnabled);
+            Serial.printf("  vibEn:      %u\n",  (unsigned)b.vibrationEnabled);
+            Serial.printf("  autoLogEn:  %u\n",  (unsigned)b.autoLogEnabled);
+            Serial.printf("  units:      %u\n",  (unsigned)b.units);
+        } else {
+            Serial.printf("  (truncated: got %u bytes, expected %u)\n",
+                          (unsigned)n, (unsigned)sizeof(SettingsBlob));
+        }
+    }
+    Serial.println(F("=================="));
+}
+
 static void handleSerialCmd(const char *cmd) {
-    if      (strcmp(cmd, "PING") == 0) Serial.println("PONG");
-    else if (strcmp(cmd, "LIST") == 0) cmdList();
-    else if (strcmp(cmd, "DUMP") == 0) cmdDump();
+    if      (strcmp(cmd, "PING")   == 0) Serial.println("PONG");
+    else if (strcmp(cmd, "LIST")   == 0) cmdList();
+    else if (strcmp(cmd, "DUMP")   == 0) cmdDump();
+    else if (strcmp(cmd, "STATUS") == 0) cmdStatus();
 }
 
 static void handleSerialInput() {
@@ -782,21 +843,7 @@ static void handleButton() {
 #define BLE_C024 "A1710024-0000-0000-0000-000000000000"
 #define BLE_C025 "A1710025-0000-0000-0000-000000000000"
 
-// ── Settings persistence via LittleFS ("/settings.bin") ──────────────────────
-// Always called from the main task. LittleFS is proven working (jump logs).
-#define SETTINGS_FILE  "/settings.bin"
-#define SETTINGS_MAGIC 0xA1
-
-struct __attribute__((packed)) SettingsBlob {
-    uint8_t  magic;
-    uint16_t alertStartFt;
-    uint16_t alertStopFt;
-    uint8_t  alertsEnabled;
-    uint8_t  vibrationEnabled;
-    uint8_t  autoLogEnabled;
-    uint8_t  units;
-};  // 9 bytes
-
+// ── Settings persistence via LittleFS — always called from the main task ──────
 static void loadSettings() {
     File f = LittleFS.open(SETTINGS_FILE, "r");
     if (!f) {
