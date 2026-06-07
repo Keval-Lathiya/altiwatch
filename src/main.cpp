@@ -30,8 +30,8 @@ struct Settings {
     // Vertical speed deadband (ft/s)
     float    vsDeadbandFps       = 0.5f;
 
-    // Battery ADC (GPIO6, 2:1 divider)
-    uint8_t  batAdcPin           = 6;
+    // Battery ADC (GPIO8, 3:1 divider: 200K+100K) — GPIO6 is BAT_BTN, not voltage divider
+    uint8_t  batAdcPin           = 8;
     int      batMvFull           = 4200;
     int      batMvEmpty          = 3300;
 
@@ -111,6 +111,12 @@ static uint32_t   logSampleCount = 0;
 #define I2C_SCL      10
 #define BTN_PIN       0
 #define MOTOR_PIN    15  // S8050 base driver — vibration motor
+// Power latch circuit (source: jeffvan302/WS_ESP32_Touch28 PWR_Key.cpp, confirmed for this board)
+//   BAT_CTL (GPIO 7): HIGH = PMOS on = power latched; LOW = PMOS off = power cut.
+//   BAT_BTN (GPIO 6): LOW = button pressed; INPUT, board has external pull-up.
+//   cfg.batAdcPin must be 8 ("BAT ADC") — GPIO 6 is the button, not the voltage divider.
+#define BAT_CTL      7
+#define BAT_BTN      6
 
 // ─── Colours (RGB565) ────────────────────────────────────────────────────────
 #define C_BG      0x0000
@@ -161,6 +167,24 @@ static float    autoStopRefAlt     = 0.0f;
 
 // ─── Motor buzz state ────────────────────────────────────────────────────────
 static uint32_t motorOffAt = 0;   // millis() deadline to cut motor; 0 = off
+
+// ─── BAT button shutdown tracking ────────────────────────────────────────────
+static uint32_t batBtnDownMs  = 0;     // millis() when re-press started; 0 = not held
+static uint32_t batBtnHighMs  = 0;     // millis() when button went HIGH (for arm debounce)
+static bool     batBtnArmed   = false; // true after 300 ms stable release post-boot
+
+// ─── Battery state ───────────────────────────────────────────────────────────
+// GPIO 8 reads the charger output node (not battery terminal directly).
+// When USB connects, the charger raises this node to ~4.1–4.2 V instantly.
+// We detect USB plug/unplug via sudden delta from the EMA, then use a
+// time-based charge estimate while USB is in.
+static float    batVoltEma     = -1.0f;   // EMA of ADC voltage (V); -1 = uninit
+static bool     batUsbPresent  = false;   // USB/charger currently detected
+static int      batLastPct     = -1;      // last real % confirmed off-USB; -1 = unknown
+static uint32_t batUsbPlugMs   = 0;       // millis() when USB plug last detected
+static uint32_t batUsbUnplugMs = 0;       // millis() when USB removal last detected
+static uint32_t lastBatMs      = 0;
+static uint32_t lastBatDbgMs   = 0;
 
 // ─── Alert flash state ───────────────────────────────────────────────────────
 enum AlertState { ALERT_OFF, ALERT_ON };
@@ -266,16 +290,88 @@ void updateBLEBadge() {
         gfx->setCursor(60, Y_HDR); gfx->print("BLE");
     }
 }
+// LiPo discharge curve — piecewise linear through measured breakpoints
+static int batPct(float v) {
+    static const float vs[] = {3.30f, 3.50f, 3.65f, 3.80f, 4.00f, 4.20f};
+    static const int   ps[] = {    0,    10,    25,    50,    75,   100};
+    if (v <= vs[0]) return 0;
+    for (int i = 1; i < 6; i++) {
+        if (v <= vs[i]) {
+            float t = (v - vs[i-1]) / (vs[i] - vs[i-1]);
+            return (int)(ps[i-1] + t * (ps[i] - ps[i-1]) + 0.5f);
+        }
+    }
+    return 100;
+}
+
 void updateBatDisplay() {
-    int adcMv = analogReadMilliVolts(cfg.batAdcPin);
-    int batMv = adcMv * 2;
-    int pct   = constrain((int)(100.0f * (batMv - cfg.batMvEmpty) /
-                                (float)(cfg.batMvFull - cfg.batMvEmpty)), 0, 100);
-    char buf[6]; snprintf(buf, sizeof(buf), "%3d%%", pct);
-    gfx->fillRect(DISP_W - 44, Y_HDR, 42, 9, C_BG);
-    uint16_t col = pct > 30 ? C_GREEN : (pct > 10 ? C_YELLOW : C_RED);
-    gfx->setTextColor(col); gfx->setTextSize(1);
-    gfx->setCursor(DISP_W - 42, Y_HDR); gfx->print(buf);
+    uint32_t now = millis();
+    float rawV = (float)analogReadMilliVolts(cfg.batAdcPin) * 3.0f / 1000.0f;
+
+    // ── USB plug/unplug detection ────────────────────────────────────────────
+    if (batVoltEma < 0.0f) {
+        batVoltEma = rawV;
+        // First reading >4.10 V can't be a resting battery — assume USB already in at boot.
+        // Note: false-positive possible for ≥87% resting charge; self-corrects on USB unplug.
+        if (rawV > 4.10f) { batUsbPresent = true; batUsbPlugMs = now; }
+    } else {
+        float delta = rawV - batVoltEma;
+        // 2-second lockout after each transition prevents noise spikes causing oscillation.
+        bool plugAllowed   = (batUsbUnplugMs == 0 || now - batUsbUnplugMs  > 2000);
+        bool unplugAllowed = (batUsbPlugMs   == 0 || now - batUsbPlugMs    > 2000);
+
+        if (!batUsbPresent && delta > 0.25f && plugAllowed) {
+            // Sudden rise → USB plugged in. Anchor % from last real EMA reading.
+            batUsbPresent = true;
+            batUsbPlugMs  = now;
+            batVoltEma    = rawV;  // reset EMA so unplug delta is reliable immediately
+        } else if (batUsbPresent && delta < -0.25f && unplugAllowed) {
+            // Sudden drop → USB unplugged. Advance anchor by time-estimated charge gain.
+            if (batLastPct >= 0) {
+                uint32_t elapsedS  = (now - batUsbPlugMs) / 1000;
+                batLastPct = min((int)(batLastPct + elapsedS * (100.0f / 7200.0f)), 100);
+            }
+            batUsbPresent   = false;
+            batUsbUnplugMs  = now;
+            batVoltEma      = rawV;  // reset EMA to battery resting voltage immediately
+        } else {
+            batVoltEma = 0.1f * rawV + 0.9f * batVoltEma;
+        }
+    }
+
+    // ── Update real reading when EMA has settled (no USB transient in last N s) ─
+    bool settled = !batUsbPresent && (
+        batUsbUnplugMs == 0 ? (now > 10000)                     // 10 s after boot
+                            : (now - batUsbUnplugMs >= 15000));  // 15 s after unplug
+    if (settled) batLastPct = batPct(batVoltEma);
+
+    // ── Rate-limit display redraws to every 5 s ──────────────────────────────
+    if (lastBatMs != 0 && now - lastBatMs < 5000) return;
+    lastBatMs = now;
+
+    // ── Compute display % ────────────────────────────────────────────────────
+    int displayPct;
+    if (!batUsbPresent) {
+        displayPct = batLastPct;             // real reading (or -1 = not yet settled)
+    } else if (batLastPct < 0) {
+        displayPct = -1;                     // booted with USB, no real anchor yet
+    } else {
+        // Time-based estimate: 1000 mAh @ ~500 mA ≈ 120 min for 100% (7200 s)
+        uint32_t elapsedS = (now - batUsbPlugMs) / 1000;
+        displayPct = min((int)(batLastPct + elapsedS * (100.0f / 7200.0f)), 100);
+    }
+
+    // ── Draw ─────────────────────────────────────────────────────────────────
+    char buf[12];
+    if      (batUsbPresent && displayPct < 0) snprintf(buf, sizeof(buf), "CHG?");
+    else if (batUsbPresent)                   snprintf(buf, sizeof(buf), "CHG%d%%", displayPct);
+    else if (displayPct < 0)                  snprintf(buf, sizeof(buf), "?");
+    else                                      snprintf(buf, sizeof(buf), "%d%%", displayPct);
+
+    gfx->fillRect(DISP_W - 50, Y_HDR, 50, 8, C_BG);
+    gfx->setTextColor(C_WHITE); gfx->setTextSize(1);
+    gfx->setCursor(DISP_W - 2 - (int16_t)(strlen(buf) * 6), Y_HDR);
+    gfx->print(buf);
 }
 void updateAltDisplay(float aglFt) {
     gfx->fillRect(0, Y_ALT_LBL, DISP_W, 8, C_BG);
@@ -890,6 +986,23 @@ static void saveSettings() {
                   cfg.alertsEnabled, cfg.vibrationEnabled, cfg.autoLogEnabled, cfg.units);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Graceful shutdown — called when BAT held ≥ 3 s
+// ═══════════════════════════════════════════════════════════════════════════
+static void gracefulShutdown() {
+    Serial.println("[Power] Shutdown: closing log + saving cfg");
+    Serial.flush();
+    if (logActive) stopLog();
+    saveSettings();
+    gfx->fillScreen(C_BG);
+    centeredText(140, 2, C_WHITE, "Powering off...");
+    delay(1500);
+    Serial.println("[Power] BAT_CTL LOW — cutting power");
+    Serial.flush();
+    digitalWrite(BAT_CTL, LOW);   // LOW = PMOS off = power cut
+    while (true) delay(10);       // unreachable; belt-and-suspenders
+}
+
 class AW_ServerCB : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer*)    override { bleConnected = true;  bleStateChanged = true; }
     void onDisconnect(NimBLEServer*) override {
@@ -1113,10 +1226,17 @@ static void updateBLENotify(float aglFt, float vsFps) {
 // setup
 // ═══════════════════════════════════════════════════════════════════════════
 void setup() {
+    // ── Power latch — must be first, before the BAT button is released ────
+    // BAT_CTL (GPIO7): HIGH = PMOS on = power latched; LOW = PMOS off = power cut.
+    pinMode(BAT_CTL, OUTPUT);
+    digitalWrite(BAT_CTL, HIGH);   // latch: HIGH keeps PMOS on → power stays on
+    pinMode(BAT_BTN, INPUT);
+
     Serial.begin(115200);
     Serial.setTxTimeoutMs(10);  // don't stall main loop if host disconnects mid-write
     uint32_t t = millis();
     while (!Serial && (millis() - t) < 3000) {}
+    Serial.println("[Power] BAT_CTL GPIO7=HIGH — power latched");
 
     analogSetAttenuation(ADC_11db);
     pinMode(LCD_BL, OUTPUT); digitalWrite(LCD_BL, HIGH);
@@ -1166,6 +1286,27 @@ void setup() {
 // ═══════════════════════════════════════════════════════════════════════════
 void loop() {
     uint32_t now = millis();
+
+    // ── BAT button: 3 s hold = graceful shutdown ─────────────────────────
+    // Only active after boot sampling; arms after 300 ms stable HIGH (debounce).
+    if (bootPhase == BOOT_RUNNING) {
+        bool batLow = (digitalRead(BAT_BTN) == LOW);
+        if (!batBtnArmed) {
+            if (!batLow) {
+                if (batBtnHighMs == 0) batBtnHighMs = now;
+                else if (now - batBtnHighMs >= 300) batBtnArmed = true;
+            } else {
+                batBtnHighMs = 0;  // any LOW resets release debounce
+            }
+        } else {
+            if (batLow) {
+                if (batBtnDownMs == 0) batBtnDownMs = now;
+                else if (now - batBtnDownMs >= 3000) gracefulShutdown();
+            } else {
+                batBtnDownMs = 0;
+            }
+        }
+    }
 
     if (bootPhase == BOOT_RUNNING) handleButton();
     handleSerialInput();
@@ -1265,6 +1406,23 @@ void loop() {
                   dispAltFt, vsFps, pressHpa, tempC,
                   imuAx, imuAy, imuAz,
                   logActive ? "  REC" : "");
+
+    // ── Battery debug (every 10 s) ────────────────────────────────────────
+    if (now - lastBatDbgMs >= 10000) {
+        lastBatDbgMs = now;
+        float batRawV = (float)analogReadMilliVolts(cfg.batAdcPin) * 3.0f / 1000.0f;
+        int truePct  = (batVoltEma > 0.0f) ? batPct(batVoltEma) : -1;
+        int dispPct;
+        if (!batUsbPresent)   dispPct = batLastPct;
+        else if (batLastPct < 0) dispPct = -1;
+        else { uint32_t el = (now - batUsbPlugMs) / 1000;
+               dispPct = min((int)(batLastPct + el * (100.0f / 7200.0f)), 100); }
+        Serial.printf("[BAT] raw=%.3fV ema=%.3fV true=%d%% disp=%d%% usb=%s anchor=%d plugSec=%lu\n",
+            batRawV, batVoltEma, truePct, dispPct,
+            batUsbPresent ? "IN" : "OUT",
+            batLastPct,
+            batUsbPresent ? (now - batUsbPlugMs) / 1000UL : 0UL);
+    }
 
     // ── 2 Hz display + BLE notify (suppressed during alert) ───────────────
     if (alertState == ALERT_OFF && now - lastDisplayMs >= 500) {
